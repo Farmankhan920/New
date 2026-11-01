@@ -1,0 +1,526 @@
+"""
+Stream Deck: restream a YouTube video/live or a Google Drive video to any RTMP(S) target
+(YouTube, Facebook, Twitch, custom) with FFmpeg -c copy. UI + backend in this one file.
+
+Env vars:
+  APP_PASSWORD  protect the page with a login (strongly recommended)
+  APP_USER      login username (default: admin)
+  YT_COOKIES    optional: contents of a Netscape cookies.txt (helps when YouTube
+                blocks the server's IP with "confirm you're not a bot")
+"""
+import os
+import re
+import secrets
+import subprocess
+import threading
+import time
+from collections import deque
+from urllib.parse import urlparse
+
+import yt_dlp
+from flask import Flask, Response, jsonify, request
+
+app = Flask(__name__)
+
+APP_USER = os.environ.get("APP_USER", "admin")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+
+COOKIE_FILE = None
+if os.environ.get("YT_COOKIES"):
+    COOKIE_FILE = "/tmp/yt_cookies.txt"
+    with open(COOKIE_FILE, "w") as f:
+        f.write(os.environ["YT_COOKIES"])
+
+lock = threading.Lock()
+state = {
+    "proc": None, "started": None, "exit_code": None,
+    "title": "", "source": "", "logs": deque(maxlen=60),
+}
+
+YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+
+
+# ---------------------------------------------------------------- auth
+@app.before_request
+def require_login():
+    if not APP_PASSWORD:
+        return None
+    a = request.authorization
+    if a and secrets.compare_digest((a.username or "").encode(), APP_USER.encode()) \
+            and secrets.compare_digest((a.password or "").encode(), APP_PASSWORD.encode()):
+        return None
+    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Stream Deck"'})
+
+
+# ---------------------------------------------------------------- source resolving
+def detect_source(url):
+    host = (urlparse(url).hostname or "").lower()
+    if host in YT_HOSTS:
+        return "youtube"
+    if host in DRIVE_HOSTS:
+        return "drive"
+    raise ValueError("Paste a YouTube or Google Drive link.")
+
+
+def resolve_drive(url):
+    m = re.search(r"/d/([\w-]+)", url) or re.search(r"[?&]id=([\w-]+)", url)
+    if not m:
+        raise ValueError("Couldn't find a file ID in that Drive link.")
+    direct = ("https://drive.usercontent.google.com/download"
+              f"?id={m.group(1)}&export=download&confirm=t")
+    return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video"}
+
+
+def resolve_youtube(url, quality):
+    cap = {"best": "", "1080": "[height<=1080]", "720": "[height<=720]", "480": "[height<=480]"}.get(quality, "")
+    # H.264 + AAC only, because FLV with -c copy accepts nothing else.
+    fmt = (f"bv*[vcodec^=avc1]{cap}+ba[acodec^=mp4a]/b[vcodec^=avc1]{cap}"
+           "/bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/b")
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "skip_download": True, "format": fmt}
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "")
+        raise ValueError(f"YouTube said no: {msg[:220]}")
+    fmts = info.get("requested_formats") or [info]
+    vcodec = (fmts[0].get("vcodec") or "")
+    if vcodec not in ("", "none") and not vcodec.startswith(("avc1", "h264")):
+        raise ValueError(f"This video only has {vcodec.split('.')[0]} video. "
+                         "-c copy needs H.264; try a lower quality.")
+    headers = info.get("http_headers") or {}
+    return {"urls": [f["url"] for f in fmts], "live": bool(info.get("is_live")),
+            "ua": headers.get("User-Agent", UA), "title": info.get("title") or "YouTube video"}
+
+
+# ---------------------------------------------------------------- ffmpeg process
+def is_running():
+    p = state["proc"]
+    return p is not None and p.poll() is None
+
+
+def pump_logs(proc, secret):
+    for line in proc.stderr:
+        line = line.strip()
+        if line:
+            state["logs"].append(line.replace(secret, "****"))
+    proc.wait()
+    with lock:
+        if state["proc"] is proc:
+            state["exit_code"] = proc.returncode
+            state["logs"].append(f"[ffmpeg exited with code {proc.returncode}]")
+
+
+def build_cmd(src, output, loop):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
+    for url in src["urls"]:
+        cmd += ["-user_agent", src["ua"],
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        if loop and not src["live"]:
+            cmd += ["-stream_loop", "-1"]
+        if not src["live"]:
+            cmd += ["-re"]
+        cmd += ["-i", url]
+    if len(src["urls"]) == 2:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+    cmd += ["-c", "copy", "-flvflags", "no_duration_filesize", "-f", "flv", output]
+    return cmd
+
+
+# ---------------------------------------------------------------- routes
+@app.get("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.post("/start")
+def start():
+    d = request.get_json(silent=True) or {}
+    video_url = (d.get("video_url") or "").strip()
+    stream_url = (d.get("stream_url") or "").strip().rstrip("/")
+    stream_key = (d.get("stream_key") or "").strip()
+    quality = d.get("quality") or "1080"
+    loop = bool(d.get("loop"))
+
+    if not (video_url and stream_url and stream_key):
+        return jsonify(error="Fill in the video link, stream URL and stream key."), 400
+    if not stream_url.startswith(("rtmp://", "rtmps://")):
+        return jsonify(error="Stream URL must start with rtmp:// or rtmps://"), 400
+    if is_running():
+        return jsonify(error="A stream is already running. Stop it first."), 409
+
+    try:
+        kind = detect_source(video_url)
+        src = resolve_drive(video_url) if kind == "drive" else resolve_youtube(video_url, quality)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+
+    cmd = build_cmd(src, f"{stream_url}/{stream_key}", loop)
+
+    with lock:
+        if is_running():
+            return jsonify(error="A stream is already running. Stop it first."), 409
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            errors="replace", bufsize=1, start_new_session=True)
+        state.update(proc=proc, started=time.time(), exit_code=None,
+                     title=src["title"], source=kind)
+        state["logs"].clear()
+        threading.Thread(target=pump_logs, args=(proc, stream_key), daemon=True).start()
+    return jsonify(ok=True, title=src["title"], live_source=src["live"])
+
+
+@app.post("/stop")
+def stop():
+    with lock:
+        proc = state["proc"] if is_running() else None
+        if proc:
+            proc.terminate()
+    if proc:
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return jsonify(ok=True)
+
+
+@app.get("/status")
+def status():
+    running = is_running()
+    return jsonify(
+        running=running,
+        uptime=int(time.time() - state["started"]) if running and state["started"] else 0,
+        exit_code=state["exit_code"], title=state["title"], source=state["source"],
+        logs=list(state["logs"]))
+
+
+# ---------------------------------------------------------------- the whole UI
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stream Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0820; --card: rgba(255,255,255,.065); --stroke: rgba(255,255,255,.13);
+    --text: #f5f2ff; --muted: #a59dc8; --hot: #ff3366; --amber: #ffab2e; --cyan: #36e2ff; --ok: #3ee89a;
+    --r-xl: 32px; --r-lg: 22px; --r-md: 16px;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body {
+    margin: 0; min-height: 100vh; color: var(--text);
+    font: 16px/1.5 "Space Grotesk", system-ui, sans-serif;
+    background:
+      radial-gradient(60rem 36rem at 8% -10%, rgba(255,51,102,.28), transparent 60%),
+      radial-gradient(50rem 34rem at 100% 0%, rgba(54,226,255,.18), transparent 60%),
+      radial-gradient(46rem 30rem at 50% 115%, rgba(124,77,255,.30), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
+    padding: 28px 16px 56px;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; display: grid; gap: 18px; }
+  .card {
+    background: var(--card); border: 1px solid var(--stroke); border-radius: var(--r-xl);
+    padding: 24px; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    box-shadow: 0 24px 60px -24px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.08);
+  }
+  h1, h2, p { margin: 0; }
+  h2 { font-size: 1.05rem; font-weight: 700; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: .9rem; margin-bottom: 18px; }
+
+  /* top bar */
+  .top { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
+  .logo { width: 44px; height: 44px; border-radius: 15px; display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--hot), var(--amber)); box-shadow: 0 10px 28px -8px var(--hot); }
+  .top h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.02em; }
+  .top span { color: var(--muted); font-size: .85rem; display: block; margin-top: -2px; }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: auto 1fr; gap: 28px; align-items: center; overflow: hidden; position: relative; }
+  .ring { width: 188px; height: 188px; position: relative; display: grid; place-items: center; }
+  .ring::before {
+    content: ""; position: absolute; inset: 0; border-radius: 50%; padding: 7px;
+    background: conic-gradient(from 0deg, var(--hot), var(--amber), var(--cyan), var(--hot));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude; opacity: .22; transition: opacity .4s;
+  }
+  .live .ring::before { opacity: 1; animation: spin 3.2s linear infinite; }
+  .live .ring { filter: drop-shadow(0 0 22px rgba(255,51,102,.55)); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ring-in { text-align: center; }
+  .state { font-weight: 700; font-size: 1.15rem; letter-spacing: .02em; color: var(--muted); }
+  .live .state { color: var(--hot); }
+  .timer { font: 400 1.35rem "JetBrains Mono", ui-monospace, monospace; margin-top: 2px; }
+  .now { min-width: 0; }
+  .now .label { color: var(--muted); font-size: .85rem; }
+  .now .title { font-size: 1.5rem; font-weight: 700; line-height: 1.25; letter-spacing: -.01em;
+    margin: 4px 0 14px; overflow-wrap: anywhere; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px;
+    background: rgba(255,255,255,.08); border: 1px solid var(--stroke); font-size: .85rem; color: var(--muted); }
+  .pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .live .pill i { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+
+  /* form */
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  label.f { display: block; font-size: .85rem; font-weight: 500; color: var(--muted); margin: 0 0 8px 4px; }
+  .field { position: relative; margin-bottom: 18px; }
+  input[type=text], input[type=url], input[type=password], select {
+    width: 100%; font: inherit; color: var(--text); padding: 14px 18px; border-radius: var(--r-md);
+    background: rgba(8,4,22,.55); border: 1px solid var(--stroke); transition: border-color .2s, box-shadow .2s;
+  }
+  select { appearance: none; -webkit-appearance: none; cursor: pointer;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='8' fill='none' stroke='%23a59dc8' stroke-width='2'><path d='M1 1l6 6 6-6'/></svg>");
+    background-repeat: no-repeat; background-position: right 18px center; padding-right: 44px; }
+  select option { background: #1a1236; }
+  input::placeholder { color: rgba(165,157,200,.55); }
+  input:focus-visible, select:focus-visible {
+    outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(54,226,255,.18); }
+  .eye { position: absolute; right: 8px; top: 8px; width: 36px; height: 36px; border-radius: 12px; border: 0;
+    background: rgba(255,255,255,.08); color: var(--muted); cursor: pointer; display: grid; place-items: center; }
+  .eye:hover { color: var(--text); }
+  .has-eye input { padding-right: 56px; }
+
+  .detect { position: absolute; right: 12px; top: 12px; padding: 4px 12px; border-radius: 999px; font-size: .78rem;
+    font-weight: 700; display: none; }
+  .detect.yt { display: block; background: rgba(255,51,102,.18); color: #ff7a9a; }
+  .detect.dr { display: block; background: rgba(54,226,255,.16); color: var(--cyan); }
+  .has-detect input { padding-right: 120px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .chip { padding: 8px 16px; border-radius: 999px; font: inherit; font-size: .88rem; font-weight: 500; cursor: pointer;
+    color: var(--text); background: rgba(255,255,255,.07); border: 1px solid var(--stroke); transition: all .2s; }
+  .chip:hover { background: rgba(255,255,255,.13); }
+  .chip[aria-pressed=true] { background: linear-gradient(135deg, var(--hot), var(--amber)); border-color: transparent; color: #1a0a14; font-weight: 700; }
+
+  .toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer;
+    padding: 12px 16px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); }
+  .toggle b { font-weight: 500; font-size: .95rem; }
+  .toggle small { color: var(--muted); display: block; font-size: .8rem; }
+  .toggle input { position: absolute; opacity: 0; pointer-events: none; }
+  .sw { flex: none; width: 48px; height: 28px; border-radius: 999px; background: rgba(255,255,255,.15); position: relative; transition: background .2s; }
+  .sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .2s; }
+  .toggle input:checked + .sw { background: var(--ok); }
+  .toggle input:checked + .sw::after { transform: translateX(20px); }
+  .toggle:focus-within { box-shadow: 0 0 0 4px rgba(54,226,255,.18); border-color: var(--cyan); }
+
+  /* actions */
+  .actions { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
+  .btn { font: inherit; font-weight: 700; font-size: 1.08rem; padding: 18px 24px; border-radius: 22px; border: 0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 10px; transition: transform .15s, box-shadow .2s, opacity .2s; }
+  .btn:active:not(:disabled) { transform: scale(.98); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
+  #run { color: #1b0a12; background: linear-gradient(120deg, var(--hot), var(--amber)); box-shadow: 0 16px 40px -12px rgba(255,51,102,.7); }
+  #run:hover:not(:disabled) { box-shadow: 0 20px 50px -10px rgba(255,51,102,.9); }
+  #stop { color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
+  #stop:hover:not(:disabled) { background: rgba(255,51,102,.22); border-color: var(--hot); }
+
+  /* console */
+  details.card { padding: 0; }
+  summary { cursor: pointer; padding: 20px 24px; font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: "+"; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: rgba(255,255,255,.09); color: var(--muted); }
+  details[open] summary::after { content: "\2212"; }
+  summary:focus-visible { outline: 3px solid var(--cyan); outline-offset: -3px; border-radius: var(--r-xl); }
+  pre { margin: 0 14px 14px; padding: 16px 18px; border-radius: var(--r-lg); background: rgba(5,2,16,.8);
+    border: 1px solid var(--stroke); color: #c5f3ff; font: 12px/1.65 "JetBrains Mono", ui-monospace, monospace;
+    max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+
+  .note { color: var(--muted); font-size: .82rem; text-align: center; padding: 0 12px; }
+
+  #toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 140%); z-index: 9;
+    max-width: calc(100vw - 32px); padding: 14px 22px; border-radius: 18px; font-weight: 500; background: #241a47;
+    border: 1px solid var(--stroke); box-shadow: 0 18px 50px -10px rgba(0,0,0,.8); transition: transform .35s cubic-bezier(.2,.9,.3,1.2); }
+  #toast.show { transform: translate(-50%, 0); }
+  #toast.err { border-color: var(--hot); } #toast.ok { border-color: var(--ok); }
+
+  @media (max-width: 720px) {
+    .hero { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+    .cols { grid-template-columns: 1fr; gap: 0; }
+    .actions { grid-template-columns: 1fr; }
+    .card { border-radius: 28px; padding: 20px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .live .ring::before { animation: none; } * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap" id="root">
+
+  <div class="top">
+    <div class="logo" aria-hidden="true">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1b0a12" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="2.2" fill="#1b0a12"/><path d="M7.2 7.2a6.8 6.8 0 0 0 0 9.6M16.8 7.2a6.8 6.8 0 0 1 0 9.6M4.2 4.2a11 11 0 0 0 0 15.6M19.8 4.2a11 11 0 0 1 0 15.6"/></svg>
+    </div>
+    <div><h1>Stream Deck</h1><span>YouTube or Drive in, anywhere out</span></div>
+  </div>
+
+  <section class="card hero" aria-live="polite">
+    <div class="ring"><div class="ring-in"><div class="state" id="state">OFFLINE</div><div class="timer" id="timer">00:00:00</div></div></div>
+    <div class="now">
+      <div class="label" id="nowLabel">Nothing is streaming</div>
+      <div class="title" id="nowTitle">Ready when you are</div>
+      <span class="pill"><i></i><span id="pillText">Server idle</span></span>
+    </div>
+  </section>
+
+  <form id="form" autocomplete="off" class="wrap" style="gap:18px">
+    <div class="cols">
+      <section class="card">
+        <h2>Source</h2>
+        <p class="sub">A YouTube video or live stream, or a Drive file shared with “Anyone with the link”.</p>
+        <div class="field has-detect">
+          <label class="f" for="video_url">Video link</label>
+          <input id="video_url" type="url" placeholder="https://youtube.com/watch?v=…" required>
+          <span class="detect" id="detect"></span>
+        </div>
+        <div class="field" id="qualityField">
+          <label class="f" for="quality">YouTube quality</label>
+          <select id="quality">
+            <option value="1080" selected>Up to 1080p</option>
+            <option value="720">Up to 720p</option>
+            <option value="480">Up to 480p</option>
+            <option value="best">Best available</option>
+          </select>
+        </div>
+        <label class="toggle">
+          <span><b>Loop the video</b><small>Restart when it ends (not for live sources)</small></span>
+          <input type="checkbox" id="loop"><span class="sw"></span>
+        </label>
+      </section>
+
+      <section class="card">
+        <h2>Destination</h2>
+        <p class="sub">Pick a platform, then paste its stream key.</p>
+        <div class="chips" id="chips" role="group" aria-label="Platform presets">
+          <button type="button" class="chip" data-url="rtmp://a.rtmp.youtube.com/live2">YouTube</button>
+          <button type="button" class="chip" data-url="rtmps://live-api-s.facebook.com:443/rtmp/">Facebook</button>
+          <button type="button" class="chip" data-url="rtmp://live.twitch.tv/app">Twitch</button>
+          <button type="button" class="chip" data-url="">Custom</button>
+        </div>
+        <div class="field">
+          <label class="f" for="stream_url">Stream URL</label>
+          <input id="stream_url" type="text" placeholder="rtmps://live-api-s.facebook.com:443/rtmp/" required>
+        </div>
+        <div class="field has-eye" style="margin-bottom:0">
+          <label class="f" for="stream_key">Stream key</label>
+          <input id="stream_key" type="password" placeholder="Paste your key" required>
+          <button type="button" class="eye" id="eye" aria-label="Show stream key">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="btn" id="run">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5z"/></svg>
+        Run
+      </button>
+      <button type="button" class="btn" id="stop" disabled>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="3"/></svg>
+        Stop
+      </button>
+    </div>
+  </form>
+
+  <details class="card" open>
+    <summary>FFmpeg console</summary>
+    <pre id="log">Nothing running.</pre>
+  </details>
+
+  <p class="note">Once it says Live you can close this tab and go offline. The server keeps streaming until you press Stop.</p>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let uptime = 0, fetchedAt = Date.now(), running = false;
+
+function toast(text, kind) {
+  const t = $("toast"); t.textContent = text; t.className = "show " + (kind || "");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", 4200);
+}
+const pad = n => String(n).padStart(2, "0");
+function fmt(s) { return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60); }
+
+function tick() { $("timer").textContent = fmt(running ? uptime + Math.floor((Date.now() - fetchedAt) / 1000) : 0); }
+
+async function refresh() {
+  try {
+    const r = await (await fetch("/status")).json();
+    running = r.running; uptime = r.uptime; fetchedAt = Date.now();
+    $("root").classList.toggle("live", r.running);
+    $("state").textContent = r.running ? "ON AIR" : "OFFLINE";
+    $("run").disabled = r.running; $("stop").disabled = !r.running;
+    $("nowLabel").textContent = r.running ? "Now streaming" : (r.exit_code !== null && r.title ? "Last stream ended" : "Nothing is streaming");
+    $("nowTitle").textContent = r.title || "Ready when you are";
+    $("pillText").textContent = r.running ? "Live from " + (r.source === "youtube" ? "YouTube" : "Google Drive") : "Server idle";
+    if (r.logs.length) {
+      const el = $("log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+      el.textContent = r.logs.join("\n"); if (atEnd) el.scrollTop = el.scrollHeight;
+    }
+    tick();
+  } catch (e) { /* offline is fine: the server keeps streaming */ }
+}
+
+// source detection
+$("video_url").addEventListener("input", e => {
+  const v = e.target.value, d = $("detect");
+  const yt = /(youtube\.com|youtu\.be)/i.test(v), dr = /(drive|docs)\.google\.com/i.test(v);
+  d.className = "detect " + (yt ? "yt" : dr ? "dr" : "");
+  d.textContent = yt ? "YouTube" : dr ? "Drive" : "";
+  $("qualityField").style.display = dr ? "none" : "";
+});
+
+// presets
+const chips = [...document.querySelectorAll(".chip")];
+chips.forEach(c => c.addEventListener("click", () => {
+  chips.forEach(x => x.setAttribute("aria-pressed", x === c));
+  $("stream_url").value = c.dataset.url;
+  (c.dataset.url ? $("stream_key") : $("stream_url")).focus();
+}));
+
+// show/hide key
+$("eye").addEventListener("click", () => {
+  const k = $("stream_key"), show = k.type === "password";
+  k.type = show ? "text" : "password";
+  $("eye").setAttribute("aria-label", show ? "Hide stream key" : "Show stream key");
+});
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("run").disabled = true; toast("Fetching the video and starting FFmpeg…");
+  try {
+    const res = await fetch("/start", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_url: $("video_url").value, stream_url: $("stream_url").value,
+        stream_key: $("stream_key").value, quality: $("quality").value, loop: $("loop").checked }) });
+    const data = await res.json();
+    if (res.ok) { toast("You’re live. You can close this tab.", "ok"); $("stream_key").value = ""; }
+    else { toast(data.error || "Couldn’t start the stream.", "err"); }
+  } catch (err) { toast("Couldn’t reach the server.", "err"); }
+  refresh();
+});
+
+$("stop").addEventListener("click", async () => {
+  await fetch("/stop", { method: "POST" }); toast("Stream stopped.", "ok"); refresh();
+});
+
+refresh(); setInterval(refresh, 3000); setInterval(tick, 1000);
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

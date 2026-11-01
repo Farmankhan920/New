@@ -8,6 +8,7 @@ Env vars:
   YT_COOKIES    optional: contents of a Netscape cookies.txt (or paste it in the UI)
   YT_PROXY      optional: proxy URL used only to reach YouTube
 """
+import json
 import os
 import re
 import secrets
@@ -74,6 +75,46 @@ def resolve_drive(url):
     return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video"}
 
 
+def cookies_to_netscape(raw):
+    """Accept Netscape cookies.txt or Cookie-Editor style JSON; return Netscape text."""
+    raw = (raw or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+    if raw[0] in "[{":
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError("Cookies look like JSON but couldn't be read. "
+                             "Export again and paste the whole text.")
+        if isinstance(data, dict):
+            data = data.get("cookies", [])
+        far = int(time.time()) + 365 * 24 * 3600
+        lines = ["# Netscape HTTP Cookie File"]
+        for c in data:
+            try:
+                domain = c["domain"]
+                host_only = bool(c.get("hostOnly", not domain.startswith(".")))
+                if not host_only and not domain.startswith("."):
+                    domain = "." + domain
+                exp = c.get("expirationDate")
+                exp = int(exp) if exp and not c.get("session") else far
+                lines.append("\t".join([
+                    ("#HttpOnly_" if c.get("httpOnly") else "") + domain,
+                    "FALSE" if host_only else "TRUE",
+                    c.get("path") or "/",
+                    "TRUE" if c.get("secure") else "FALSE",
+                    str(exp), c["name"], str(c.get("value", "")),
+                ]))
+            except (KeyError, TypeError, AttributeError):
+                continue
+        if len(lines) == 1:
+            raise ValueError("No usable cookies found in what you pasted.")
+        return "\n".join(lines)
+    if not raw.startswith(("# Netscape", "# HTTP Cookie")):
+        raw = "# Netscape HTTP Cookie File\n" + raw
+    return raw
+
+
 def resolve_youtube(url, quality, cookie_text=""):
     cap = {"best": "", "1080": "[height<=1080]", "720": "[height<=720]", "480": "[height<=480]"}.get(quality, "")
     # H.264 + AAC only, because FLV with -c copy accepts nothing else.
@@ -85,10 +126,8 @@ def resolve_youtube(url, quality, cookie_text=""):
         opts["proxy"] = os.environ["YT_PROXY"]
 
     cookie_path = None
-    text = (cookie_text or ENV_COOKIES or "").replace("\r\n", "\n").strip()
+    text = cookies_to_netscape(cookie_text or ENV_COOKIES or "")
     if text:
-        if not text.startswith(("# Netscape", "# HTTP Cookie")):
-            text = "# Netscape HTTP Cookie File\n" + text
         fd, cookie_path = tempfile.mkstemp(suffix=".txt")
         with os.fdopen(fd, "w") as f:
             f.write(text + "\n")
@@ -476,7 +515,7 @@ INDEX_HTML = r"""<!doctype html>
         <p class="sub" style="margin-bottom:10px">YouTube often blocks cloud servers. Paste your cookies once and this browser remembers them. Use a spare Google account.</p>
         <ol class="steps">
           <li>On a computer (or Kiwi Browser), open a private window and sign in to YouTube.</li>
-          <li>Open youtube.com/robots.txt and export with the “Get cookies.txt LOCALLY” extension.</li>
+          <li>Open youtube.com/robots.txt and export them (Cookie-Editor JSON or a cookies.txt file both work).</li>
           <li>Close the private window, then paste the exported text here.</li>
         </ol>
         <textarea id="cookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;…" spellcheck="false"></textarea>

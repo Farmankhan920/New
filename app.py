@@ -7,6 +7,7 @@ Env vars:
   APP_USER      login username (default: admin)
   YT_COOKIES    optional: contents of a Netscape cookies.txt (or paste it in the UI)
   YT_PROXY      optional: proxy URL used only to reach YouTube
+  KEEPALIVE_URL optional: public URL of this app (auto-detected on Render/Koyeb)
 """
 import json
 import os
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from collections import deque
 from urllib.parse import urlparse
 
@@ -35,8 +37,9 @@ class NeedCookies(ValueError):
 
 lock = threading.Lock()
 state = {
-    "proc": None, "started": None, "exit_code": None,
-    "title": "", "source": "", "logs": deque(maxlen=60),
+    "job": None, "started": None, "exit_code": None, "title": "", "source": "",
+    "phase": "", "restarts": 0, "duration": 0, "progress": "",
+    "logs": deque(maxlen=60),
 }
 
 YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
@@ -47,7 +50,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Sa
 # ---------------------------------------------------------------- auth
 @app.before_request
 def require_login():
-    if not APP_PASSWORD:
+    if not APP_PASSWORD or request.path == "/health":
         return None
     a = request.authorization
     if a and secrets.compare_digest((a.username or "").encode(), APP_USER.encode()) \
@@ -72,7 +75,8 @@ def resolve_drive(url):
         raise ValueError("Couldn't find a file ID in that Drive link.")
     direct = ("https://drive.usercontent.google.com/download"
               f"?id={m.group(1)}&export=download&confirm=t")
-    return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video"}
+    return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video",
+            "duration": probe_duration(direct)}
 
 
 def cookies_to_netscape(raw):
@@ -167,44 +171,59 @@ def resolve_youtube(url, quality, cookie_text=""):
                          "-c copy needs H.264; try a lower quality.")
     headers = info.get("http_headers") or {}
     return {"urls": [f["url"] for f in fmts], "live": bool(info.get("is_live")),
-            "ua": headers.get("User-Agent", UA), "title": info.get("title") or "YouTube video"}
+            "ua": headers.get("User-Agent", UA), "title": info.get("title") or "YouTube video",
+            "duration": 0 if info.get("is_live") else int(info.get("duration") or 0)}
 
 
-# ---------------------------------------------------------------- ffmpeg process
+# ---------------------------------------------------------------- ffmpeg supervisor
+TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+STALL_SECONDS = 60   # no media progress for this long -> restart ffmpeg
+MAX_FAILS = 30       # consecutive failed attempts before giving up
+
+
 def is_running():
-    p = state["proc"]
-    return p is not None and p.poll() is None
+    j = state["job"]
+    return bool(j and j["active"])
 
 
-def pump_logs(proc, secret):
-    for line in proc.stderr:
-        line = line.strip()
-        if line:
-            state["logs"].append(line.replace(secret, "****"))
-    proc.wait()
-    with lock:
-        if state["proc"] is proc:
-            state["exit_code"] = proc.returncode
-            state["logs"].append(f"[ffmpeg exited with code {proc.returncode}]")
+def log(msg):
+    state["logs"].append(msg)
+
+
+def hms(sec):
+    sec = int(sec)
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def probe_duration(url):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-user_agent", UA, "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", url],
+            capture_output=True, text=True, timeout=25).stdout.strip()
+        return int(float(out))
+    except Exception:
+        return 0
 
 
 def normalize_stream_url(url):
     """Make the ingest URL explicit: scheme://host:port/path (IVS hosts need :443 and /app)."""
     p = urlparse(url)
     host = p.hostname or ""
-    secure = p.scheme == "rtmps"
-    port = p.port or (443 if secure else 1935)
+    port = p.port or (443 if p.scheme == "rtmps" else 1935)
     path = p.path.rstrip("/")
     if not path and host.endswith("live-video.net"):
         path = "/app"
     return f"{p.scheme}://{host}:{port}{path}"
 
 
-def build_cmd(src, output, loop):
+def build_cmd(src, output, loop, start_at=0.0):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
     for url in src["urls"]:
         cmd += ["-user_agent", src["ua"],
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        if start_at > 0 and not src["live"]:
+            cmd += ["-ss", f"{start_at:.2f}"]
         if loop and not src["live"]:
             cmd += ["-stream_loop", "-1"]
         if not src["live"]:
@@ -218,10 +237,149 @@ def build_cmd(src, output, loop):
     return cmd
 
 
+def resolve_source(job):
+    if job["kind"] == "drive":
+        return resolve_drive(job["video_url"])
+    return resolve_youtube(job["video_url"], job["quality"], job["cookies"])
+
+
+def pump_logs(job, proc, base, run):
+    for line in proc.stderr:
+        line = line.strip()
+        if not line:
+            continue
+        line = line.replace(job["key"], "****")[:300]
+        m = TIME_RE.search(line)
+        if m:
+            t = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+            job["pos"] = base + t
+            if t > run["last_t"]:
+                run["last_t"], run["beat"] = t, time.time()
+            state["progress"] = line
+        else:
+            log(line)
+
+
+def nap(job, seconds):
+    for _ in range(int(seconds)):
+        if job["stop"]:
+            return
+        time.sleep(1)
+
+
+def resume_point(job, src):
+    if src["live"] or job["pos"] < 5:
+        return 0.0
+    pos = job["pos"] - 3  # replay a few seconds so nothing is skipped
+    dur = src.get("duration") or 0
+    if job["loop"]:
+        return (pos % dur) if dur else 0.0
+    return max(0.0, pos)
+
+
+def supervise(job, src):
+    """Run ffmpeg and keep it running: if it drops or stalls, resume where it left off."""
+    fails, first, rc = 0, True, None
+    try:
+        while not job["stop"]:
+            if not first:
+                state["phase"] = "reconnecting"
+                try:
+                    src = resolve_source(job)
+                except ValueError as e:
+                    fails += 1
+                    log(f"[could not refresh the video link: {e}]")
+                    if fails > MAX_FAILS:
+                        break
+                    nap(job, min(5 + 3 * fails, 30))
+                    continue
+            first = False
+            dur = src.get("duration") or 0
+            state["duration"] = dur
+            start_at = resume_point(job, src)
+            cmd = build_cmd(src, job["output"], job["loop"], start_at)
+            run = {"last_t": -1.0, "beat": time.time()}
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                errors="replace", bufsize=1, start_new_session=True)
+            job["proc"] = proc
+            state["phase"] = "streaming"
+            reader = threading.Thread(target=pump_logs, args=(job, proc, start_at, run), daemon=True)
+            reader.start()
+
+            while proc.poll() is None:
+                if job["stop"]:
+                    break
+                if time.time() - run["beat"] > STALL_SECONDS:
+                    log(f"[no progress for {STALL_SECONDS}s, restarting ffmpeg]")
+                    proc.kill()
+                    break
+                time.sleep(1)
+            proc.wait()
+            reader.join(timeout=3)
+            rc = proc.returncode
+            if job["stop"]:
+                break
+
+            if job["loop"]:
+                complete = False
+            elif src["live"]:
+                complete = rc == 0
+            elif dur:
+                complete = job["pos"] >= dur - 8
+            else:
+                complete = rc == 0
+            if complete:
+                log("[finished: the video played to the end]")
+                break
+
+            fails = 0 if run["last_t"] >= 20 else fails + 1
+            if fails > MAX_FAILS:
+                log("[giving up after repeated failures]")
+                break
+            wait = min(2 + 3 * fails, 30)
+            state["restarts"] += 1
+            log(f"[stream dropped (code {rc}); resuming from {hms(job['pos'])} in {wait}s]")
+            nap(job, wait)
+    except Exception as e:  # never let the supervisor die silently
+        log(f"[supervisor error: {e}]")
+    finally:
+        job["active"] = False
+        state["exit_code"] = rc
+        state["phase"] = ""
+        state["progress"] = ""
+        if job["stop"]:
+            log("[stopped]")
+
+
+def keepalive():
+    """Free hosts sleep without inbound traffic; ping our own public URL while streaming."""
+    base = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+    if not base and os.environ.get("KOYEB_PUBLIC_DOMAIN"):
+        base = "https://" + os.environ["KOYEB_PUBLIC_DOMAIN"]
+    if not base:
+        return
+    while True:
+        time.sleep(240)
+        if is_running():
+            try:
+                urllib.request.urlopen(base.rstrip("/") + "/health", timeout=15).read()
+            except Exception:
+                pass
+
+
+threading.Thread(target=keepalive, daemon=True).start()
+
+
 # ---------------------------------------------------------------- routes
 @app.get("/")
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.get("/health")
+def health():
+    return "ok"
 
 
 @app.post("/start")
@@ -243,50 +401,56 @@ def start():
 
     try:
         kind = detect_source(video_url)
+        cookies = d.get("cookies") or ""
         src = (resolve_drive(video_url) if kind == "drive"
-               else resolve_youtube(video_url, quality, d.get("cookies") or ""))
+               else resolve_youtube(video_url, quality, cookies))
     except NeedCookies as e:
         return jsonify(error=str(e), need_cookies=True), 400
     except ValueError as e:
         return jsonify(error=str(e)), 400
 
-    cmd = build_cmd(src, f"{stream_url}/{stream_key}", loop)
-
     with lock:
         if is_running():
             return jsonify(error="A stream is already running. Stop it first."), 409
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            errors="replace", bufsize=1, start_new_session=True)
-        state.update(proc=proc, started=time.time(), exit_code=None,
-                     title=src["title"], source=kind)
+        job = {"active": True, "stop": False, "proc": None, "pos": 0.0, "kind": kind,
+               "video_url": video_url, "quality": quality, "cookies": cookies, "loop": loop,
+               "output": f"{stream_url}/{stream_key}", "key": stream_key}
+        state.update(job=job, started=time.time(), exit_code=None, title=src["title"],
+                     source=kind, phase="streaming", restarts=0, progress="",
+                     duration=src.get("duration") or 0)
         state["logs"].clear()
-        threading.Thread(target=pump_logs, args=(proc, stream_key), daemon=True).start()
+        threading.Thread(target=supervise, args=(job, src), daemon=True).start()
     return jsonify(ok=True, title=src["title"], live_source=src["live"])
 
 
 @app.post("/stop")
 def stop():
-    with lock:
-        proc = state["proc"] if is_running() else None
-        if proc:
+    job = state["job"]
+    if job and job["active"]:
+        job["stop"] = True
+        proc = job.get("proc")
+        if proc and proc.poll() is None:
             proc.terminate()
-    if proc:
-        try:
-            proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     return jsonify(ok=True)
 
 
 @app.get("/status")
 def status():
     running = is_running()
+    job = state["job"]
+    logs = list(state["logs"])
+    if running and state["progress"]:
+        logs.append(state["progress"])
     return jsonify(
         running=running,
         uptime=int(time.time() - state["started"]) if running and state["started"] else 0,
         exit_code=state["exit_code"], title=state["title"], source=state["source"],
-        logs=list(state["logs"]))
+        phase=state["phase"], restarts=state["restarts"], duration=state["duration"],
+        pos=int(job["pos"]) if job else 0, logs=logs)
 
 
 # ---------------------------------------------------------------- the whole UI
@@ -471,6 +635,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="label" id="nowLabel">Nothing is streaming</div>
       <div class="title" id="nowTitle">Ready when you are</div>
       <span class="pill"><i></i><span id="pillText">Server idle</span></span>
+      <div class="label" id="prog" style="margin-top:12px"></div>
     </div>
   </section>
 
@@ -555,7 +720,7 @@ INDEX_HTML = r"""<!doctype html>
     <pre id="log">Nothing running.</pre>
   </details>
 
-  <p class="note">Once it says Live you can close this tab and go offline. The server keeps streaming until you press Stop.</p>
+  <p class="note">Once it says Live you can close this tab and go offline. The server keeps streaming, and resumes by itself if the link drops, until the video ends or you press Stop.</p>
 </div>
 <div id="toast" role="status"></div>
 
@@ -581,7 +746,12 @@ async function refresh() {
     $("run").disabled = r.running; $("stop").disabled = !r.running;
     $("nowLabel").textContent = r.running ? "Now streaming" : (r.exit_code !== null && r.title ? "Last stream ended" : "Nothing is streaming");
     $("nowTitle").textContent = r.title || "Ready when you are";
-    $("pillText").textContent = r.running ? "Live from " + (r.source === "youtube" ? "YouTube" : "Google Drive") : "Server idle";
+    const src = r.source === "youtube" ? "YouTube" : "Google Drive";
+    $("pillText").textContent = !r.running ? "Server idle"
+      : (r.phase === "reconnecting" ? "Reconnecting to " + src : "Live from " + src)
+        + (r.restarts ? ", resumed " + r.restarts + (r.restarts === 1 ? " time" : " times") : "");
+    $("state").textContent = r.running ? (r.phase === "reconnecting" ? "RETRYING" : "ON AIR") : "OFFLINE";
+    $("prog").textContent = r.running && r.duration ? "Played " + fmt(r.pos) + " of " + fmt(r.duration) : "";
     if (r.logs.length) {
       const el = $("log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
       el.textContent = r.logs.join("\n"); if (atEnd) el.scrollTop = el.scrollHeight;

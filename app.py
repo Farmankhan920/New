@@ -82,11 +82,23 @@ def resolve_youtube(url, quality):
             "skip_download": True, "format": fmt}
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "")
+    if os.environ.get("YT_PROXY"):
+        opts["proxy"] = os.environ["YT_PROXY"]
+
+    # No cookies? Try several YouTube player clients; some get past the bot check.
+    info, last_err = None, None
+    for client in (None, "tv", "android_vr", "web_safari", "mweb"):
+        o = dict(opts)
+        if client:
+            o["extractor_args"] = {"youtube": {"player_client": [client]}}
+        try:
+            with yt_dlp.YoutubeDL(o) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+    if info is None:
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(last_err)).replace("ERROR: ", "")
         raise ValueError(f"YouTube said no: {msg[:220]}")
     fmts = info.get("requested_formats") or [info]
     vcodec = (fmts[0].get("vcodec") or "")

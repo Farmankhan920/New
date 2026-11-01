@@ -188,6 +188,18 @@ def pump_logs(proc, secret):
             state["logs"].append(f"[ffmpeg exited with code {proc.returncode}]")
 
 
+def normalize_stream_url(url):
+    """Make the ingest URL explicit: scheme://host:port/path (IVS hosts need :443 and /app)."""
+    p = urlparse(url)
+    host = p.hostname or ""
+    secure = p.scheme == "rtmps"
+    port = p.port or (443 if secure else 1935)
+    path = p.path.rstrip("/")
+    if not path and host.endswith("live-video.net"):
+        path = "/app"
+    return f"{p.scheme}://{host}:{port}{path}"
+
+
 def build_cmd(src, output, loop):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
     for url in src["urls"]:
@@ -227,6 +239,7 @@ def start():
         return jsonify(error="Stream URL must start with rtmp:// or rtmps://"), 400
     if is_running():
         return jsonify(error="A stream is already running. Stop it first."), 409
+    stream_url = normalize_stream_url(stream_url)
 
     try:
         kind = detect_source(video_url)
@@ -493,6 +506,7 @@ INDEX_HTML = r"""<!doctype html>
           <button type="button" class="chip" data-url="rtmp://a.rtmp.youtube.com/live2">YouTube</button>
           <button type="button" class="chip" data-url="rtmps://live-api-s.facebook.com:443/rtmp/">Facebook</button>
           <button type="button" class="chip" data-url="rtmp://live.twitch.tv/app">Twitch</button>
+          <button type="button" class="chip" data-url="rtmps://fa723fc1b171.global-contribute.live-video.net:443/app">Kick</button>
           <button type="button" class="chip" data-url="">Custom</button>
         </div>
         <div class="field">

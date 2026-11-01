@@ -5,13 +5,14 @@ Stream Deck: restream a YouTube video/live or a Google Drive video to any RTMP(S
 Env vars:
   APP_PASSWORD  protect the page with a login (strongly recommended)
   APP_USER      login username (default: admin)
-  YT_COOKIES    optional: contents of a Netscape cookies.txt (helps when YouTube
-                blocks the server's IP with "confirm you're not a bot")
+  YT_COOKIES    optional: contents of a Netscape cookies.txt (or paste it in the UI)
+  YT_PROXY      optional: proxy URL used only to reach YouTube
 """
 import os
 import re
 import secrets
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -25,11 +26,11 @@ app = Flask(__name__)
 APP_USER = os.environ.get("APP_USER", "admin")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 
-COOKIE_FILE = None
-if os.environ.get("YT_COOKIES"):
-    COOKIE_FILE = "/tmp/yt_cookies.txt"
-    with open(COOKIE_FILE, "w") as f:
-        f.write(os.environ["YT_COOKIES"])
+ENV_COOKIES = os.environ.get("YT_COOKIES", "")
+
+
+class NeedCookies(ValueError):
+    """YouTube blocked the server's IP and wants a logged-in session."""
 
 lock = threading.Lock()
 state = {
@@ -73,33 +74,53 @@ def resolve_drive(url):
     return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video"}
 
 
-def resolve_youtube(url, quality):
+def resolve_youtube(url, quality, cookie_text=""):
     cap = {"best": "", "1080": "[height<=1080]", "720": "[height<=720]", "480": "[height<=480]"}.get(quality, "")
     # H.264 + AAC only, because FLV with -c copy accepts nothing else.
     fmt = (f"bv*[vcodec^=avc1]{cap}+ba[acodec^=mp4a]/b[vcodec^=avc1]{cap}"
            "/bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/b")
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
             "skip_download": True, "format": fmt}
-    if COOKIE_FILE:
-        opts["cookiefile"] = COOKIE_FILE
     if os.environ.get("YT_PROXY"):
         opts["proxy"] = os.environ["YT_PROXY"]
 
-    # No cookies? Try several YouTube player clients; some get past the bot check.
+    cookie_path = None
+    text = (cookie_text or ENV_COOKIES or "").replace("\r\n", "\n").strip()
+    if text:
+        if not text.startswith(("# Netscape", "# HTTP Cookie")):
+            text = "# Netscape HTTP Cookie File\n" + text
+        fd, cookie_path = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(text + "\n")
+        opts["cookiefile"] = cookie_path
+
     info, last_err = None, None
-    for client in (None, "tv", "android_vr", "web_safari", "mweb"):
-        o = dict(opts)
-        if client:
-            o["extractor_args"] = {"youtube": {"player_client": [client]}}
-        try:
-            with yt_dlp.YoutubeDL(o) as ydl:
-                info = ydl.extract_info(url, download=False)
-            break
-        except yt_dlp.utils.DownloadError as e:
-            last_err = e
+    try:
+        # Try several YouTube player clients; some get past the bot check.
+        for client in (None, "tv", "android_vr", "web_safari", "mweb"):
+            o = dict(opts)
+            if client:
+                o["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with yt_dlp.YoutubeDL(o) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                break
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+    finally:
+        if cookie_path:
+            try:
+                os.remove(cookie_path)
+            except OSError:
+                pass
+
     if info is None:
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(last_err)).replace("ERROR: ", "")
+        if "not a bot" in msg or "Sign in" in msg:
+            raise NeedCookies("YouTube blocked this server. Paste your YouTube cookies in "
+                              "the YouTube access box below, then press Run again.")
         raise ValueError(f"YouTube said no: {msg[:220]}")
+
     fmts = info.get("requested_formats") or [info]
     vcodec = (fmts[0].get("vcodec") or "")
     if vcodec not in ("", "none") and not vcodec.startswith(("avc1", "h264")):
@@ -170,7 +191,10 @@ def start():
 
     try:
         kind = detect_source(video_url)
-        src = resolve_drive(video_url) if kind == "drive" else resolve_youtube(video_url, quality)
+        src = (resolve_drive(video_url) if kind == "drive"
+               else resolve_youtube(video_url, quality, d.get("cookies") or ""))
+    except NeedCookies as e:
+        return jsonify(error=str(e), need_cookies=True), 400
     except ValueError as e:
         return jsonify(error=str(e)), 400
 
@@ -339,6 +363,18 @@ INDEX_HTML = r"""<!doctype html>
   #stop { color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
   #stop:hover:not(:disabled) { background: rgba(255,51,102,.22); border-color: var(--hot); }
 
+  textarea { width: 100%; font: 12px/1.5 "JetBrains Mono", ui-monospace, monospace; color: var(--text); min-height: 120px;
+    padding: 14px 18px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); resize: vertical; }
+  textarea:focus-visible { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(54,226,255,.18); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .mini { font: inherit; font-size: .85rem; font-weight: 500; padding: 8px 16px; border-radius: 999px; cursor: pointer;
+    color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
+  .mini:hover { background: rgba(255,51,102,.22); border-color: var(--hot); }
+  .steps { color: var(--muted); font-size: .88rem; margin: 0 0 14px; padding-left: 20px; }
+  .steps li { margin-bottom: 4px; }
+  #cookieState { font-size: .85rem; color: var(--muted); }
+  #cookieState.on { color: var(--ok); }
+
   /* console */
   details.card { padding: 0; }
   summary { cursor: pointer; padding: 20px 24px; font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; }
@@ -434,6 +470,21 @@ INDEX_HTML = r"""<!doctype html>
       </section>
     </div>
 
+    <details class="card" id="cookieBox">
+      <summary>YouTube access <span id="cookieState">No cookies saved</span></summary>
+      <div style="padding: 0 24px 24px">
+        <p class="sub" style="margin-bottom:10px">YouTube often blocks cloud servers. Paste your cookies once and this browser remembers them. Use a spare Google account.</p>
+        <ol class="steps">
+          <li>On a computer (or Kiwi Browser), open a private window and sign in to YouTube.</li>
+          <li>Open youtube.com/robots.txt and export with the “Get cookies.txt LOCALLY” extension.</li>
+          <li>Close the private window, then paste the exported text here.</li>
+        </ol>
+        <textarea id="cookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;…" spellcheck="false"></textarea>
+        <div class="row"><span class="sub" style="margin:0">Sent only to your server when you press Run.</span>
+          <button type="button" class="mini" id="clearCookies">Clear cookies</button></div>
+      </div>
+    </details>
+
     <div class="actions">
       <button type="submit" class="btn" id="run">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5z"/></svg>
@@ -461,7 +512,7 @@ let uptime = 0, fetchedAt = Date.now(), running = false;
 
 function toast(text, kind) {
   const t = $("toast"); t.textContent = text; t.className = "show " + (kind || "");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", 4200);
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", kind === "err" ? 9000 : 4200);
 }
 const pad = n => String(n).padStart(2, "0");
 function fmt(s) { return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60); }
@@ -495,13 +546,49 @@ $("video_url").addEventListener("input", e => {
   $("qualityField").style.display = dr ? "none" : "";
 });
 
-// presets
+// ---- remember last values across refreshes
+const FIELDS = ["video_url", "stream_url", "stream_key", "quality", "cookies"];
+const store = {
+  get(k) { try { return localStorage.getItem("sd_" + k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem("sd_" + k, v); } catch (e) {} }
+};
 const chips = [...document.querySelectorAll(".chip")];
+
+function syncChips() {
+  const cur = $("stream_url").value.trim();
+  let hit = false;
+  chips.forEach(c => { const on = !!c.dataset.url && c.dataset.url === cur; if (on) hit = true; c.setAttribute("aria-pressed", on); });
+  const custom = chips.find(c => !c.dataset.url);
+  custom.setAttribute("aria-pressed", !hit && cur !== "");
+}
+function cookieStatus() {
+  const on = $("cookies").value.trim().length > 20;
+  $("cookieState").textContent = on ? "Cookies saved in this browser" : "No cookies saved";
+  $("cookieState").className = on ? "on" : "";
+}
+
+FIELDS.forEach(k => ["input", "change"].forEach(ev => $(k).addEventListener(ev, () => {
+  store.set(k, $(k).value);
+  if (k === "stream_url") syncChips();
+  if (k === "cookies") cookieStatus();
+})));
+$("loop").addEventListener("change", () => store.set("loop", $("loop").checked ? "1" : "0"));
+
+FIELDS.forEach(k => { const v = store.get(k); if (v !== null) $(k).value = v; });
+$("loop").checked = store.get("loop") === "1";
+$("video_url").dispatchEvent(new Event("input"));
+syncChips(); cookieStatus();
+
+// presets
 chips.forEach(c => c.addEventListener("click", () => {
-  chips.forEach(x => x.setAttribute("aria-pressed", x === c));
-  $("stream_url").value = c.dataset.url;
+  const isPreset = v => chips.some(x => x.dataset.url && x.dataset.url === v);
+  if (c.dataset.url) $("stream_url").value = c.dataset.url;
+  else if (isPreset($("stream_url").value.trim())) $("stream_url").value = "";
+  store.set("stream_url", $("stream_url").value); syncChips();
   (c.dataset.url ? $("stream_key") : $("stream_url")).focus();
 }));
+
+$("clearCookies").addEventListener("click", () => { $("cookies").value = ""; store.set("cookies", ""); cookieStatus(); toast("Cookies cleared.", "ok"); });
 
 // show/hide key
 $("eye").addEventListener("click", () => {
@@ -516,10 +603,14 @@ $("form").addEventListener("submit", async e => {
   try {
     const res = await fetch("/start", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ video_url: $("video_url").value, stream_url: $("stream_url").value,
-        stream_key: $("stream_key").value, quality: $("quality").value, loop: $("loop").checked }) });
+        stream_key: $("stream_key").value, quality: $("quality").value, loop: $("loop").checked,
+        cookies: $("cookies").value }) });
     const data = await res.json();
-    if (res.ok) { toast("You’re live. You can close this tab.", "ok"); $("stream_key").value = ""; }
-    else { toast(data.error || "Couldn’t start the stream.", "err"); }
+    if (res.ok) { toast("You’re live. You can close this tab.", "ok"); }
+    else {
+      toast(data.error || "Couldn’t start the stream.", "err");
+      if (data.need_cookies) { $("cookieBox").open = true; $("cookieBox").scrollIntoView({ behavior: "smooth", block: "center" }); }
+    }
   } catch (err) { toast("Couldn’t reach the server.", "err"); }
   refresh();
 });

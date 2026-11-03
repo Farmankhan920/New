@@ -1,852 +1,294 @@
 """
-Stream Deck: restream a YouTube video/live or a Google Drive video to any RTMP(S) target
-(YouTube, Facebook, Twitch, custom) with FFmpeg -c copy. UI + backend in this one file.
+Farman920 Vertical Live Timer — single-file Flask app
 
-Env vars:
-  APP_PASSWORD  protect the page with a login (strongly recommended)
-  APP_USER      login username (default: admin)
-  YT_COOKIES    optional: contents of a Netscape cookies.txt (or paste it in the UI)
-  YT_PROXY      optional: proxy URL used only to reach YouTube
-  KEEPALIVE_URL optional: public URL of this app (auto-detected on Render/Koyeb)
+DEPLOYMENT (Render or another always-on Linux server):
+  Build command:  pip install flask gunicorn
+  Start command:  gunicorn --workers 1 --threads 4 --timeout 0 app:app
+
+The server must have FFmpeg installed and available on PATH.
+On Render, use an always-on paid service/worker for long streams. Free web
+services can sleep/stop and are not suitable for a 100-hour broadcast.
+
+Optional security:
+  Set DASHBOARD_PASSWORD in the server environment. The dashboard then uses
+  HTTP Basic Authentication. Do not expose an unprotected RTMP control panel.
+
+This app generates a vertical 480x854 animated slate (not your phone screen),
+with silent audio, and pushes it to the YouTube RTMP ingest server.
 """
-import json
+
 import os
 import re
-import secrets
-import subprocess
+import time
+import shutil
 import tempfile
 import threading
-import time
-import urllib.request
-from collections import deque
-from urllib.parse import urlparse
-
-import yt_dlp
-from flask import Flask, Response, jsonify, request
+import subprocess
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-APP_USER = os.environ.get("APP_USER", "admin")
-APP_PASSWORD = os.environ.get("APP_PASSWORD")
+DURATION_SECONDS = 100 * 60 * 60
+YOUTUBE_RTMP = "rtmp://a.rtmp.youtube.com/live2"
 
-ENV_COOKIES = os.environ.get("YT_COOKIES", "")
-
-
-class NeedCookies(ValueError):
-    """YouTube blocked the server's IP and wants a logged-in session."""
-
-lock = threading.Lock()
-state = {
-    "job": None, "started": None, "exit_code": None, "title": "", "source": "",
-    "phase": "", "restarts": 0, "duration": 0, "progress": "",
-    "logs": deque(maxlen=60),
+_lock = threading.Lock()
+_state = {
+    "running": False,
+    "started_at": None,
+    "ends_at": None,
+    "error": None,
+    "process": None,
+    "timer_file": None,
+    "monitor": None,
 }
 
-YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
-DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="theme-color" content="#f8f5ee">
+<title>Farman920 • Live Control</title>
+<style>
+:root{--bg:#f8f5ee;--card:#fffdf8;--ink:#17251f;--muted:#718078;--green:#16845b;--gold:#c99a43;--line:#e9e4d9}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0%,#e8f0e7 0,transparent 32%),var(--bg);color:var(--ink);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+main{width:min(100% - 28px,520px);margin:0 auto;padding:24px 0 38px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}
+.brand{display:flex;align-items:center;gap:11px}.logo{width:44px;height:44px;border-radius:16px;background:linear-gradient(145deg,#1c9a6a,#12533f);display:grid;place-items:center;color:white;font-weight:900;box-shadow:0 8px 20px #16845b30}
+h1{font-size:18px;margin:0;letter-spacing:-.4px}.sub{font-size:11px;color:var(--muted);margin-top:3px}
+.pill{font-size:11px;font-weight:800;letter-spacing:.6px;padding:8px 11px;border-radius:30px;background:#eeeae1;color:#647068}.pill.live{background:#e4f5eb;color:#087647}
+h2{font-size:14px;margin:0 0 14px}.card{background:#ffffffc9;border:1px solid #fff;border-radius:25px;padding:19px;margin:13px 0;box-shadow:0 12px 35px #273a2c0b}
+.preview{position:relative;overflow:hidden;border-radius:25px;background:linear-gradient(150deg,#0b1e19,#102d25 60%,#16251f);color:white;aspect-ratio:9/16;max-height:440px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:25px}
+.preview:before,.preview:after{content:"";position:absolute;border:1px solid #ffffff16;border-radius:50%;width:280px;height:280px;animation:orbit 14s linear infinite}.preview:after{width:360px;height:360px;animation-duration:21s;animation-direction:reverse}
+.glow{position:absolute;width:170px;height:170px;border-radius:50%;background:#1a9a6b35;filter:blur(40px);animation:pulse 4s ease-in-out infinite}
+.live-tag{z-index:1;color:#ffb5a8;font-size:10px;font-weight:900;letter-spacing:2px;margin-bottom:22px}.digits{z-index:1;font-size:clamp(36px,10vw,58px);font-weight:900;letter-spacing:-3px;font-variant-numeric:tabular-nums;text-shadow:0 0 25px #54dca466}
+.preview-label{z-index:1;font-size:10px;letter-spacing:3px;color:#a7c8b7;margin-top:10px}.preview-brand{z-index:1;margin-top:36px;font-size:13px;font-weight:800;letter-spacing:2px}.preview-handle{z-index:1;color:#8eafa0;font-size:10px;margin-top:7px}
+@keyframes orbit{to{transform:rotate(360deg)}}@keyframes pulse{50%{transform:scale(1.35);opacity:.55}}
+.field{display:block;font-size:11px;color:#66756d;font-weight:800;margin:13px 0 7px;letter-spacing:.3px}
+input{width:100%;border:1px solid var(--line);border-radius:15px;padding:14px;background:#fffefa;color:var(--ink);font:14px inherit;outline:none}
+input:focus{border-color:#70b99a;box-shadow:0 0 0 3px #16845b13}
+button{border:0;border-radius:17px;padding:16px;width:100%;font-weight:900;font-size:14px;cursor:pointer;transition:transform .2s,filter .2s}
+button:active{transform:scale(.98)}.start{background:linear-gradient(110deg,#16845b,#0d6848);color:white;box-shadow:0 10px 22px #16845b30;margin-top:16px}
+.stop{background:#fff0ed;color:#b83c2b;margin-top:10px}.stop:disabled{opacity:.4;cursor:not-allowed}
+.note{font-size:11px;color:var(--muted);line-height:1.55;margin:12px 2px 0}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{background:#f7f5ef;border-radius:16px;padding:12px}.stat b{display:block;font-size:13px}.stat span{font-size:10px;color:var(--muted)}
+.profile{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.profile:last-child{border:0}.profile span{color:var(--muted)}.profile b{text-align:right;overflow-wrap:anywhere}
+#message{font-size:12px;line-height:1.5;color:var(--muted);margin-top:10px;min-height:18px}
+footer{text-align:center;color:#89958d;font-size:10px;margin-top:20px;letter-spacing:.5px}
+</style>
+</head>
+<body><main>
+<header><div class="brand"><div class="logo">F</div><div><h1>FARMAN920 LIVE</h1><div class="sub">VERTICAL BROADCAST CONTROL</div></div></div><div id="status" class="pill">● OFFLINE</div></header>
+<section class="preview">
+<div class="glow"></div><div class="live-tag">● LIVE BROADCAST</div>
+<div class="digits" id="countdown">100:00:00</div><div class="preview-label">HOURS · MINUTES · SECONDS</div>
+<div class="preview-brand">FARMAN920</div><div class="preview-handle">@UNLIMITED_16K · IGFARMAN</div>
+</section>
+<div class="stats"><div class="stat"><b>480p Vertical</b><span>480 × 854 · 30 FPS</span></div><div class="stat"><b>100 Hours</b><span>Cloud-side countdown</span></div></div>
+<section class="card">
+<h2>YouTube RTMP Connection</h2>
+<label class="field" for="rtmp">RTMP SERVER URL</label>
+<input id="rtmp" value="rtmp://a.rtmp.youtube.com/live2" autocomplete="url">
+<label class="field" for="key">YOUTUBE STREAM KEY</label>
+<input id="key" type="password" placeholder="Paste your YouTube stream key" autocomplete="off">
+<button class="start" id="start" onclick="startStream()">START 100-HOUR LIVE</button>
+<button class="stop" id="stop" onclick="stopStream()" disabled>STOP STREAM</button>
+<div id="message">Enter your YouTube stream key, then start. Keep this key private.</div>
+</section>
+<section class="card"><h2>Channel & Creator</h2>
+<div class="profile"><span>Streaming channel</span><b>@UNLIMITED_16K</b></div>
+<div class="profile"><span>Creator brand</span><b>Farman920</b></div>
+<div class="profile"><span>Instagram</span><b>@IGFARMAN</b></div>
+<div class="profile"><span>UPI ID</span><b>farman920@ybl</b></div>
+<p class="note">The live video is an animated timer screen generated by the cloud server. It does not capture your phone display or game. UPI is shown here as profile information only; it is not embedded in the live video.</p>
+</section>
+<footer>MADE FOR FARMAN920 · CLOUD STREAM SESSION</footer>
+</main>
+<script>
+let localEnd=null, poller=null;
+const $=id=>document.getElementById(id);
+function fmt(s){s=Math.max(0,Math.floor(s));let h=Math.floor(s/3600),m=Math.floor(s%3600/60),v=s%60;return [h,m,v].map(n=>String(n).padStart(2,'0')).join(':')}
+function paint(){if(localEnd){let left=Math.max(0,Math.floor(localEnd-Date.now()/1000));$('countdown').textContent=fmt(left)}}
+async function refresh(){try{let r=await fetch('/status'),d=await r.json();$('status').textContent=d.running?'● LIVE':'● OFFLINE';$('status').className='pill'+(d.running?' live':'');$('start').disabled=d.running;$('stop').disabled=!d.running;if(d.running&&d.ends_at){localEnd=d.ends_at;paint()}else{localEnd=null;$('countdown').textContent=d.error?'ERROR':'100:00:00'}if(d.error)$('message').textContent='Server: '+d.error}catch(e){$('message').textContent='Cannot reach streaming server.'}}
+async function startStream(){let rtmp=$('rtmp').value.trim(),key=$('key').value.trim();if(!/^rtmps?:\/\//i.test(rtmp)||!key){$('message').textContent='Valid RTMP URL aur stream key dono enter karein.';return}
+$('start').disabled=true;$('message').textContent='Starting cloud encoder…';
+try{let r=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rtmp,key})}),d=await r.json();$('message').textContent=d.message||d.error||'Request complete';await refresh()}catch(e){$('message').textContent='Start request failed.';$('start').disabled=false}}
+async function stopStream(){if(!confirm('Live stream stop karna hai?'))return;let r=await fetch('/stop',{method:'POST'});let d=await r.json();$('message').textContent=d.message||d.error;await refresh()}
+setInterval(paint,250);setInterval(refresh,3000);refresh();
+</script></body></html>"""
 
 
-# ---------------------------------------------------------------- auth
+def _auth_ok():
+    password = os.environ.get("DASHBOARD_PASSWORD")
+    if not password:
+        return True
+    auth = request.authorization
+    return bool(auth and auth.password == password)
+
+
 @app.before_request
-def require_login():
-    if not APP_PASSWORD or request.path == "/health":
-        return None
-    a = request.authorization
-    if a and secrets.compare_digest((a.username or "").encode(), APP_USER.encode()) \
-            and secrets.compare_digest((a.password or "").encode(), APP_PASSWORD.encode()):
-        return None
-    return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Stream Deck"'})
+def protect_dashboard():
+    if not _auth_ok():
+        return Response("Authentication required", 401,
+                        {"WWW-Authenticate": 'Basic realm="Farman920 Live"'})
 
 
-# ---------------------------------------------------------------- source resolving
-def detect_source(url):
-    host = (urlparse(url).hostname or "").lower()
-    if host in YT_HOSTS:
-        return "youtube"
-    if host in DRIVE_HOSTS:
-        return "drive"
-    raise ValueError("Paste a YouTube or Google Drive link.")
-
-
-def resolve_drive(url):
-    m = re.search(r"/d/([\w-]+)", url) or re.search(r"[?&]id=([\w-]+)", url)
-    if not m:
-        raise ValueError("Couldn't find a file ID in that Drive link.")
-    direct = ("https://drive.usercontent.google.com/download"
-              f"?id={m.group(1)}&export=download&confirm=t")
-    return {"urls": [direct], "live": False, "ua": UA, "title": "Google Drive video",
-            "duration": probe_duration(direct)}
-
-
-def cookies_to_netscape(raw):
-    """Accept Netscape cookies.txt or Cookie-Editor style JSON; return Netscape text."""
-    raw = (raw or "").replace("\r\n", "\n").strip()
-    if not raw:
-        return ""
-    if raw[0] in "[{":
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            raise ValueError("Cookies look like JSON but couldn't be read. "
-                             "Export again and paste the whole text.")
-        if isinstance(data, dict):
-            data = data.get("cookies", [])
-        far = int(time.time()) + 365 * 24 * 3600
-        lines = ["# Netscape HTTP Cookie File"]
-        for c in data:
-            try:
-                domain = c["domain"]
-                host_only = bool(c.get("hostOnly", not domain.startswith(".")))
-                if not host_only and not domain.startswith("."):
-                    domain = "." + domain
-                exp = c.get("expirationDate")
-                exp = int(exp) if exp and not c.get("session") else far
-                lines.append("\t".join([
-                    ("#HttpOnly_" if c.get("httpOnly") else "") + domain,
-                    "FALSE" if host_only else "TRUE",
-                    c.get("path") or "/",
-                    "TRUE" if c.get("secure") else "FALSE",
-                    str(exp), c["name"], str(c.get("value", "")),
-                ]))
-            except (KeyError, TypeError, AttributeError):
-                continue
-        if len(lines) == 1:
-            raise ValueError("No usable cookies found in what you pasted.")
-        return "\n".join(lines)
-    if not raw.startswith(("# Netscape", "# HTTP Cookie")):
-        raw = "# Netscape HTTP Cookie File\n" + raw
-    return raw
-
-
-def resolve_youtube(url, quality, cookie_text=""):
-    cap = {"best": "", "1080": "[height<=1080]", "720": "[height<=720]", "480": "[height<=480]"}.get(quality, "")
-    # H.264 + AAC only, because FLV with -c copy accepts nothing else.
-    fmt = (f"bv*[vcodec^=avc1]{cap}+ba[acodec^=mp4a]/b[vcodec^=avc1]{cap}"
-           "/bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/b")
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
-            "skip_download": True, "format": fmt}
-    if os.environ.get("YT_PROXY"):
-        opts["proxy"] = os.environ["YT_PROXY"]
-
-    cookie_path = None
-    text = cookies_to_netscape(cookie_text or ENV_COOKIES or "")
-    if text:
-        fd, cookie_path = tempfile.mkstemp(suffix=".txt")
-        with os.fdopen(fd, "w") as f:
-            f.write(text + "\n")
-        opts["cookiefile"] = cookie_path
-
-    info, last_err = None, None
-    try:
-        # Try several YouTube player clients; some get past the bot check.
-        for client in (None, "tv", "android_vr", "web_safari", "mweb"):
-            o = dict(opts)
-            if client:
-                o["extractor_args"] = {"youtube": {"player_client": [client]}}
-            try:
-                with yt_dlp.YoutubeDL(o) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                break
-            except yt_dlp.utils.DownloadError as e:
-                last_err = e
-    finally:
-        if cookie_path:
-            try:
-                os.remove(cookie_path)
-            except OSError:
-                pass
-
-    if info is None:
-        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(last_err)).replace("ERROR: ", "")
-        if "not a bot" in msg or "Sign in" in msg:
-            raise NeedCookies("YouTube blocked this server. Paste your YouTube cookies in "
-                              "the YouTube access box below, then press Run again.")
-        raise ValueError(f"YouTube said no: {msg[:220]}")
-
-    fmts = info.get("requested_formats") or [info]
-    vcodec = (fmts[0].get("vcodec") or "")
-    if vcodec not in ("", "none") and not vcodec.startswith(("avc1", "h264")):
-        raise ValueError(f"This video only has {vcodec.split('.')[0]} video. "
-                         "-c copy needs H.264; try a lower quality.")
-    headers = info.get("http_headers") or {}
-    return {"urls": [f["url"] for f in fmts], "live": bool(info.get("is_live")),
-            "ua": headers.get("User-Agent", UA), "title": info.get("title") or "YouTube video",
-            "duration": 0 if info.get("is_live") else int(info.get("duration") or 0)}
-
-
-# ---------------------------------------------------------------- ffmpeg supervisor
-TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
-STALL_SECONDS = 60   # no media progress for this long -> restart ffmpeg
-MAX_FAILS = 30       # consecutive failed attempts before giving up
-
-
-def is_running():
-    j = state["job"]
-    return bool(j and j["active"])
-
-
-def log(msg):
-    state["logs"].append(msg)
-
-
-def hms(sec):
-    sec = int(sec)
-    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
-
-
-def probe_duration(url):
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-user_agent", UA, "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", url],
-            capture_output=True, text=True, timeout=25).stdout.strip()
-        return int(float(out))
-    except Exception:
-        return 0
-
-
-def normalize_stream_url(url):
-    """Make the ingest URL explicit: scheme://host:port/path (IVS hosts need :443 and /app)."""
-    p = urlparse(url)
-    host = p.hostname or ""
-    port = p.port or (443 if p.scheme == "rtmps" else 1935)
-    path = p.path.rstrip("/")
-    if not path and host.endswith("live-video.net"):
-        path = "/app"
-    return f"{p.scheme}://{host}:{port}{path}"
-
-
-def build_cmd(src, output, loop, start_at=0.0):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
-    for url in src["urls"]:
-        cmd += ["-user_agent", src["ua"],
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-        if start_at > 0 and not src["live"]:
-            cmd += ["-ss", f"{start_at:.2f}"]
-        if loop and not src["live"]:
-            cmd += ["-stream_loop", "-1"]
-        if not src["live"]:
-            cmd += ["-re"]
-        cmd += ["-i", url]
-    if len(src["urls"]) == 2:
-        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
-    else:
-        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-    cmd += ["-c", "copy", "-flvflags", "no_duration_filesize", "-f", "flv", output]
-    return cmd
-
-
-def resolve_source(job):
-    if job["kind"] == "drive":
-        return resolve_drive(job["video_url"])
-    return resolve_youtube(job["video_url"], job["quality"], job["cookies"])
-
-
-def pump_logs(job, proc, base, run):
-    for line in proc.stderr:
-        line = line.strip()
-        if not line:
-            continue
-        line = line.replace(job["key"], "****")[:300]
-        m = TIME_RE.search(line)
-        if m:
-            t = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
-            job["pos"] = base + t
-            if t > run["last_t"]:
-                run["last_t"], run["beat"] = t, time.time()
-            state["progress"] = line
-        else:
-            log(line)
-
-
-def nap(job, seconds):
-    for _ in range(int(seconds)):
-        if job["stop"]:
-            return
+def _write_countdown(path, end_time):
+    while True:
+        remaining = max(0, int(end_time - time.time()))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{remaining // 3600:02d}:{(remaining % 3600) // 60:02d}:{remaining % 60:02d}")
+        if remaining <= 0:
+            break
         time.sleep(1)
 
 
-def resume_point(job, src):
-    if src["live"] or job["pos"] < 5:
-        return 0.0
-    pos = job["pos"] - 3  # replay a few seconds so nothing is skipped
-    dur = src.get("duration") or 0
-    if job["loop"]:
-        return (pos % dur) if dur else 0.0
-    return max(0.0, pos)
+def _stop_process():
+    with _lock:
+        proc = _state.get("process")
+        timer = _state.get("monitor")
+        _state["running"] = False
+        _state["process"] = None
+        path = _state.get("timer_file")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
-def supervise(job, src):
-    """Run ffmpeg and keep it running: if it drops or stalls, resume where it left off."""
-    fails, first, rc = 0, True, None
+def _monitor_process(proc, timer_path, end_time):
+    while proc.poll() is None and time.time() < end_time:
+        time.sleep(2)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    err = None
+    if proc.returncode not in (0, None):
+        err = f"FFmpeg stopped (exit code {proc.returncode}). Check RTMP URL/key and server FFmpeg logs."
+    with _lock:
+        if _state.get("process") is proc:
+            _state["running"] = False
+            _state["process"] = None
+            _state["error"] = err
+            _state["timer_file"] = None
     try:
-        while not job["stop"]:
-            if not first:
-                state["phase"] = "reconnecting"
-                try:
-                    src = resolve_source(job)
-                except ValueError as e:
-                    fails += 1
-                    log(f"[could not refresh the video link: {e}]")
-                    if fails > MAX_FAILS:
-                        break
-                    nap(job, min(5 + 3 * fails, 30))
-                    continue
-            first = False
-            dur = src.get("duration") or 0
-            state["duration"] = dur
-            start_at = resume_point(job, src)
-            cmd = build_cmd(src, job["output"], job["loop"], start_at)
-            run = {"last_t": -1.0, "beat": time.time()}
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                errors="replace", bufsize=1, start_new_session=True)
-            job["proc"] = proc
-            state["phase"] = "streaming"
-            reader = threading.Thread(target=pump_logs, args=(job, proc, start_at, run), daemon=True)
-            reader.start()
-
-            while proc.poll() is None:
-                if job["stop"]:
-                    break
-                if time.time() - run["beat"] > STALL_SECONDS:
-                    log(f"[no progress for {STALL_SECONDS}s, restarting ffmpeg]")
-                    proc.kill()
-                    break
-                time.sleep(1)
-            proc.wait()
-            reader.join(timeout=3)
-            rc = proc.returncode
-            if job["stop"]:
-                break
-
-            if job["loop"]:
-                complete = False
-            elif src["live"]:
-                complete = rc == 0
-            elif dur:
-                complete = job["pos"] >= dur - 8
-            else:
-                complete = rc == 0
-            if complete:
-                log("[finished: the video played to the end]")
-                break
-
-            fails = 0 if run["last_t"] >= 20 else fails + 1
-            if fails > MAX_FAILS:
-                log("[giving up after repeated failures]")
-                break
-            wait = min(2 + 3 * fails, 30)
-            state["restarts"] += 1
-            log(f"[stream dropped (code {rc}); resuming from {hms(job['pos'])} in {wait}s]")
-            nap(job, wait)
-    except Exception as e:  # never let the supervisor die silently
-        log(f"[supervisor error: {e}]")
-    finally:
-        job["active"] = False
-        state["exit_code"] = rc
-        state["phase"] = ""
-        state["progress"] = ""
-        if job["stop"]:
-            log("[stopped]")
+        os.unlink(timer_path)
+    except OSError:
+        pass
 
 
-def keepalive():
-    """Free hosts sleep without inbound traffic; ping our own public URL while streaming."""
-    base = os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
-    if not base and os.environ.get("KOYEB_PUBLIC_DOMAIN"):
-        base = "https://" + os.environ["KOYEB_PUBLIC_DOMAIN"]
-    if not base:
-        return
-    while True:
-        time.sleep(240)
-        if is_running():
-            try:
-                urllib.request.urlopen(base.rstrip("/") + "/health", timeout=15).read()
-            except Exception:
-                pass
-
-
-threading.Thread(target=keepalive, daemon=True).start()
-
-
-# ---------------------------------------------------------------- routes
 @app.get("/")
 def index():
-    return Response(INDEX_HTML, mimetype="text/html")
-
-
-@app.get("/health")
-def health():
-    return "ok"
-
-
-@app.post("/start")
-def start():
-    d = request.get_json(silent=True) or {}
-    video_url = (d.get("video_url") or "").strip()
-    stream_url = (d.get("stream_url") or "").strip().rstrip("/")
-    stream_key = (d.get("stream_key") or "").strip()
-    quality = d.get("quality") or "1080"
-    loop = bool(d.get("loop"))
-
-    if not (video_url and stream_url and stream_key):
-        return jsonify(error="Fill in the video link, stream URL and stream key."), 400
-    if not stream_url.startswith(("rtmp://", "rtmps://")):
-        return jsonify(error="Stream URL must start with rtmp:// or rtmps://"), 400
-    if is_running():
-        return jsonify(error="A stream is already running. Stop it first."), 409
-    stream_url = normalize_stream_url(stream_url)
-
-    try:
-        kind = detect_source(video_url)
-        cookies = d.get("cookies") or ""
-        src = (resolve_drive(video_url) if kind == "drive"
-               else resolve_youtube(video_url, quality, cookies))
-    except NeedCookies as e:
-        return jsonify(error=str(e), need_cookies=True), 400
-    except ValueError as e:
-        return jsonify(error=str(e)), 400
-
-    with lock:
-        if is_running():
-            return jsonify(error="A stream is already running. Stop it first."), 409
-        job = {"active": True, "stop": False, "proc": None, "pos": 0.0, "kind": kind,
-               "video_url": video_url, "quality": quality, "cookies": cookies, "loop": loop,
-               "output": f"{stream_url}/{stream_key}", "key": stream_key}
-        state.update(job=job, started=time.time(), exit_code=None, title=src["title"],
-                     source=kind, phase="streaming", restarts=0, progress="",
-                     duration=src.get("duration") or 0)
-        state["logs"].clear()
-        threading.Thread(target=supervise, args=(job, src), daemon=True).start()
-    return jsonify(ok=True, title=src["title"], live_source=src["live"])
-
-
-@app.post("/stop")
-def stop():
-    job = state["job"]
-    if job and job["active"]:
-        job["stop"] = True
-        proc = job.get("proc")
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-    return jsonify(ok=True)
+    return HTML
 
 
 @app.get("/status")
 def status():
-    running = is_running()
-    job = state["job"]
-    logs = list(state["logs"])
-    if running and state["progress"]:
-        logs.append(state["progress"])
-    return jsonify(
-        running=running,
-        uptime=int(time.time() - state["started"]) if running and state["started"] else 0,
-        exit_code=state["exit_code"], title=state["title"], source=state["source"],
-        phase=state["phase"], restarts=state["restarts"], duration=state["duration"],
-        pos=int(job["pos"]) if job else 0, logs=logs)
+    with _lock:
+        running = bool(_state["running"] and _state["process"] and _state["process"].poll() is None)
+        return jsonify(running=running, started_at=_state["started_at"],
+                       ends_at=_state["ends_at"], error=_state["error"])
 
 
-# ---------------------------------------------------------------- the whole UI
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stream Deck</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #0d0820; --card: rgba(255,255,255,.065); --stroke: rgba(255,255,255,.13);
-    --text: #f5f2ff; --muted: #a59dc8; --hot: #ff3366; --amber: #ffab2e; --cyan: #36e2ff; --ok: #3ee89a;
-    --r-xl: 32px; --r-lg: 22px; --r-md: 16px;
-  }
-  * { box-sizing: border-box; }
-  html { background: var(--bg); }
-  body {
-    margin: 0; min-height: 100vh; color: var(--text);
-    font: 16px/1.5 "Space Grotesk", system-ui, sans-serif;
-    background:
-      radial-gradient(60rem 36rem at 8% -10%, rgba(255,51,102,.28), transparent 60%),
-      radial-gradient(50rem 34rem at 100% 0%, rgba(54,226,255,.18), transparent 60%),
-      radial-gradient(46rem 30rem at 50% 115%, rgba(124,77,255,.30), transparent 60%),
-      var(--bg);
-    background-attachment: fixed;
-    padding: 28px 16px 56px;
-  }
-  .wrap { max-width: 920px; margin: 0 auto; display: grid; gap: 18px; }
-  .card {
-    background: var(--card); border: 1px solid var(--stroke); border-radius: var(--r-xl);
-    padding: 24px; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
-    box-shadow: 0 24px 60px -24px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.08);
-  }
-  h1, h2, p { margin: 0; }
-  h2 { font-size: 1.05rem; font-weight: 700; margin-bottom: 4px; }
-  .sub { color: var(--muted); font-size: .9rem; margin-bottom: 18px; }
+@app.post("/start")
+def start():
+    if not shutil.which("ffmpeg"):
+        return jsonify(error="FFmpeg is not installed on this server. Install FFmpeg and restart."), 500
+    data = request.get_json(silent=True) or {}
+    rtmp = str(data.get("rtmp", "")).strip()
+    key = str(data.get("key", "")).strip()
+    if not re.match(r"^rtmps?://", rtmp, re.I) or not key or any(c.isspace() for c in key):
+        return jsonify(error="Valid RTMP URL aur stream key enter karein."), 400
+    if len(key) > 300 or len(rtmp) > 500:
+        return jsonify(error="RTMP URL or stream key is too long."), 400
 
-  /* top bar */
-  .top { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
-  .logo { width: 44px; height: 44px; border-radius: 15px; display: grid; place-items: center;
-    background: linear-gradient(135deg, var(--hot), var(--amber)); box-shadow: 0 10px 28px -8px var(--hot); }
-  .top h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.02em; }
-  .top span { color: var(--muted); font-size: .85rem; display: block; margin-top: -2px; }
+    with _lock:
+        old = _state.get("process")
+        if old and old.poll() is None:
+            return jsonify(message="A stream is already running."), 409
 
-  /* hero */
-  .hero { display: grid; grid-template-columns: auto 1fr; gap: 28px; align-items: center; overflow: hidden; position: relative; }
-  .ring { width: 188px; height: 188px; position: relative; display: grid; place-items: center; }
-  .ring::before {
-    content: ""; position: absolute; inset: 0; border-radius: 50%; padding: 7px;
-    background: conic-gradient(from 0deg, var(--hot), var(--amber), var(--cyan), var(--hot));
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor; mask-composite: exclude; opacity: .22; transition: opacity .4s;
-  }
-  .live .ring::before { opacity: 1; animation: spin 3.2s linear infinite; }
-  .live .ring { filter: drop-shadow(0 0 22px rgba(255,51,102,.55)); }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .ring-in { text-align: center; }
-  .state { font-weight: 700; font-size: 1.15rem; letter-spacing: .02em; color: var(--muted); }
-  .live .state { color: var(--hot); }
-  .timer { font: 400 1.35rem "JetBrains Mono", ui-monospace, monospace; margin-top: 2px; }
-  .now { min-width: 0; }
-  .now .label { color: var(--muted); font-size: .85rem; }
-  .now .title { font-size: 1.5rem; font-weight: 700; line-height: 1.25; letter-spacing: -.01em;
-    margin: 4px 0 14px; overflow-wrap: anywhere; }
-  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px;
-    background: rgba(255,255,255,.08); border: 1px solid var(--stroke); font-size: .85rem; color: var(--muted); }
-  .pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .live .pill i { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+    timer_file = tempfile.NamedTemporaryFile(mode="w", prefix="farm920_", suffix=".txt",
+                                              delete=False, encoding="utf-8")
+    timer_path = timer_file.name
+    timer_file.write("100:00:00")
+    timer_file.close()
+    end_time = time.time() + DURATION_SECONDS
 
-  /* form */
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-  label.f { display: block; font-size: .85rem; font-weight: 500; color: var(--muted); margin: 0 0 8px 4px; }
-  .field { position: relative; margin-bottom: 18px; }
-  input[type=text], input[type=url], input[type=password], select {
-    width: 100%; font: inherit; color: var(--text); padding: 14px 18px; border-radius: var(--r-md);
-    background: rgba(8,4,22,.55); border: 1px solid var(--stroke); transition: border-color .2s, box-shadow .2s;
-  }
-  select { appearance: none; -webkit-appearance: none; cursor: pointer;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='8' fill='none' stroke='%23a59dc8' stroke-width='2'><path d='M1 1l6 6 6-6'/></svg>");
-    background-repeat: no-repeat; background-position: right 18px center; padding-right: 44px; }
-  select option { background: #1a1236; }
-  input::placeholder { color: rgba(165,157,200,.55); }
-  input:focus-visible, select:focus-visible {
-    outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(54,226,255,.18); }
-  .eye { position: absolute; right: 8px; top: 8px; width: 36px; height: 36px; border-radius: 12px; border: 0;
-    background: rgba(255,255,255,.08); color: var(--muted); cursor: pointer; display: grid; place-items: center; }
-  .eye:hover { color: var(--text); }
-  .has-eye input { padding-right: 56px; }
+    # Video: 480x854 portrait animated background and countdown; audio: silence.
+    # The RTMP key is passed as part of the output URL and is never returned by /status.
+    video_filter = (
+        "drawbox=x='(w-110)/2+90*sin(t*0.7)':y='150+35*cos(t*0.9)':"
+        "w=110:h=3:color=0x31d69a@0.65:t=fill,"
+        f"drawtext=textfile={timer_path}:reload=1:fontcolor=white:fontsize=58:"
+        "x=(w-text_w)/2:y=(h-text_h)/2-25,"
+        "drawtext=text='FARMAN920':fontcolor=0x9ce5c1:fontsize=27:"
+        "x=(w-text_w)/2:y=h*0.68,"
+        "drawtext=text='@UNLIMITED_16K  |  IGFARMAN':fontcolor=0xb0c9bc:fontsize=14:"
+        "x=(w-text_w)/2:y=h*0.73"
+    )
+    output_url = rtmp.rstrip("/") + "/" + key
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-re", "-f", "lavfi", "-i", "color=c=0x0b1e19:s=480x854:r=30",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t", str(DURATION_SECONDS),
+        "-vf", video_filter,
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
+        "-b:v", "800k", "-maxrate", "900k", "-bufsize", "1600k",
+        "-c:a", "aac", "-b:a", "96k", "-ar", "44100",
+        "-f", "flv", output_url
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                text=True)
+        time.sleep(1.5)
+        if proc.poll() is not None:
+            os.unlink(timer_path)
+            return jsonify(error="FFmpeg could not connect. Check the RTMP URL, stream key, and FFmpeg build."), 502
+    except Exception as exc:
+        try:
+            os.unlink(timer_path)
+        except OSError:
+            pass
+        return jsonify(error=f"Could not launch FFmpeg: {exc}"), 500
 
-  .detect { position: absolute; right: 12px; top: 12px; padding: 4px 12px; border-radius: 999px; font-size: .78rem;
-    font-weight: 700; display: none; }
-  .detect.yt { display: block; background: rgba(255,51,102,.18); color: #ff7a9a; }
-  .detect.dr { display: block; background: rgba(54,226,255,.16); color: var(--cyan); }
-  .has-detect input { padding-right: 120px; }
+    with _lock:
+        _state.update(running=True, started_at=int(time.time()),
+                      ends_at=int(end_time), error=None, process=proc,
+                      timer_file=timer_path)
+    threading.Thread(target=_write_countdown, args=(timer_path, end_time),
+                     daemon=True).start()
+    monitor = threading.Thread(target=_monitor_process,
+                               args=(proc, timer_path, end_time), daemon=True)
+    with _lock:
+        _state["monitor"] = monitor
+    monitor.start()
+    return jsonify(message="Stream started. Countdown is running on the cloud server.",
+                   ends_at=int(end_time))
 
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
-  .chip { padding: 8px 16px; border-radius: 999px; font: inherit; font-size: .88rem; font-weight: 500; cursor: pointer;
-    color: var(--text); background: rgba(255,255,255,.07); border: 1px solid var(--stroke); transition: all .2s; }
-  .chip:hover { background: rgba(255,255,255,.13); }
-  .chip[aria-pressed=true] { background: linear-gradient(135deg, var(--hot), var(--amber)); border-color: transparent; color: #1a0a14; font-weight: 700; }
 
-  .toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer;
-    padding: 12px 16px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); }
-  .toggle b { font-weight: 500; font-size: .95rem; }
-  .toggle small { color: var(--muted); display: block; font-size: .8rem; }
-  .toggle input { position: absolute; opacity: 0; pointer-events: none; }
-  .sw { flex: none; width: 48px; height: 28px; border-radius: 999px; background: rgba(255,255,255,.15); position: relative; transition: background .2s; }
-  .sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff; transition: transform .2s; }
-  .toggle input:checked + .sw { background: var(--ok); }
-  .toggle input:checked + .sw::after { transform: translateX(20px); }
-  .toggle:focus-within { box-shadow: 0 0 0 4px rgba(54,226,255,.18); border-color: var(--cyan); }
+@app.post("/stop")
+def stop():
+    with _lock:
+        proc = _state.get("process")
+        if not proc or proc.poll() is not None:
+            _state["running"] = False
+            return jsonify(message="No active stream.")
+    _stop_process()
+    return jsonify(message="Stream stopped.")
 
-  /* actions */
-  .actions { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
-  .btn { font: inherit; font-weight: 700; font-size: 1.08rem; padding: 18px 24px; border-radius: 22px; border: 0; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; gap: 10px; transition: transform .15s, box-shadow .2s, opacity .2s; }
-  .btn:active:not(:disabled) { transform: scale(.98); }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
-  .btn:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
-  #run { color: #1b0a12; background: linear-gradient(120deg, var(--hot), var(--amber)); box-shadow: 0 16px 40px -12px rgba(255,51,102,.7); }
-  #run:hover:not(:disabled) { box-shadow: 0 20px 50px -10px rgba(255,51,102,.9); }
-  #stop { color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
-  #stop:hover:not(:disabled) { background: rgba(255,51,102,.22); border-color: var(--hot); }
-
-  textarea { width: 100%; font: 12px/1.5 "JetBrains Mono", ui-monospace, monospace; color: var(--text); min-height: 120px;
-    padding: 14px 18px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); resize: vertical; }
-  textarea:focus-visible { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 4px rgba(54,226,255,.18); }
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
-  .mini { font: inherit; font-size: .85rem; font-weight: 500; padding: 8px 16px; border-radius: 999px; cursor: pointer;
-    color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
-  .mini:hover { background: rgba(255,51,102,.22); border-color: var(--hot); }
-  .steps { color: var(--muted); font-size: .88rem; margin: 0 0 14px; padding-left: 20px; }
-  .steps li { margin-bottom: 4px; }
-  #cookieState { font-size: .85rem; color: var(--muted); }
-  #cookieState.on { color: var(--ok); }
-
-  /* console */
-  details.card { padding: 0; }
-  summary { cursor: pointer; padding: 20px 24px; font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; }
-  summary::-webkit-details-marker { display: none; }
-  summary::after { content: "+"; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: rgba(255,255,255,.09); color: var(--muted); }
-  details[open] summary::after { content: "\2212"; }
-  summary:focus-visible { outline: 3px solid var(--cyan); outline-offset: -3px; border-radius: var(--r-xl); }
-  pre { margin: 0 14px 14px; padding: 16px 18px; border-radius: var(--r-lg); background: rgba(5,2,16,.8);
-    border: 1px solid var(--stroke); color: #c5f3ff; font: 12px/1.65 "JetBrains Mono", ui-monospace, monospace;
-    max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-
-  .note { color: var(--muted); font-size: .82rem; text-align: center; padding: 0 12px; }
-
-  #toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 140%); z-index: 9;
-    max-width: calc(100vw - 32px); padding: 14px 22px; border-radius: 18px; font-weight: 500; background: #241a47;
-    border: 1px solid var(--stroke); box-shadow: 0 18px 50px -10px rgba(0,0,0,.8); transition: transform .35s cubic-bezier(.2,.9,.3,1.2); }
-  #toast.show { transform: translate(-50%, 0); }
-  #toast.err { border-color: var(--hot); } #toast.ok { border-color: var(--ok); }
-
-  @media (max-width: 720px) {
-    .hero { grid-template-columns: 1fr; justify-items: center; text-align: center; }
-    .cols { grid-template-columns: 1fr; gap: 0; }
-    .actions { grid-template-columns: 1fr; }
-    .card { border-radius: 28px; padding: 20px; }
-  }
-  @media (prefers-reduced-motion: reduce) { .live .ring::before { animation: none; } * { transition: none !important; } }
-</style>
-</head>
-<body>
-<div class="wrap" id="root">
-
-  <div class="top">
-    <div class="logo" aria-hidden="true">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1b0a12" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="2.2" fill="#1b0a12"/><path d="M7.2 7.2a6.8 6.8 0 0 0 0 9.6M16.8 7.2a6.8 6.8 0 0 1 0 9.6M4.2 4.2a11 11 0 0 0 0 15.6M19.8 4.2a11 11 0 0 1 0 15.6"/></svg>
-    </div>
-    <div><h1>Stream Deck</h1><span>YouTube or Drive in, anywhere out</span></div>
-  </div>
-
-  <section class="card hero" aria-live="polite">
-    <div class="ring"><div class="ring-in"><div class="state" id="state">OFFLINE</div><div class="timer" id="timer">00:00:00</div></div></div>
-    <div class="now">
-      <div class="label" id="nowLabel">Nothing is streaming</div>
-      <div class="title" id="nowTitle">Ready when you are</div>
-      <span class="pill"><i></i><span id="pillText">Server idle</span></span>
-      <div class="label" id="prog" style="margin-top:12px"></div>
-    </div>
-  </section>
-
-  <form id="form" autocomplete="off" class="wrap" style="gap:18px">
-    <div class="cols">
-      <section class="card">
-        <h2>Source</h2>
-        <p class="sub">A YouTube video or live stream, or a Drive file shared with “Anyone with the link”.</p>
-        <div class="field has-detect">
-          <label class="f" for="video_url">Video link</label>
-          <input id="video_url" type="url" placeholder="https://youtube.com/watch?v=…" required>
-          <span class="detect" id="detect"></span>
-        </div>
-        <div class="field" id="qualityField">
-          <label class="f" for="quality">YouTube quality</label>
-          <select id="quality">
-            <option value="1080" selected>Up to 1080p</option>
-            <option value="720">Up to 720p</option>
-            <option value="480">Up to 480p</option>
-            <option value="best">Best available</option>
-          </select>
-        </div>
-        <label class="toggle">
-          <span><b>Loop the video</b><small>Restart when it ends (not for live sources)</small></span>
-          <input type="checkbox" id="loop"><span class="sw"></span>
-        </label>
-      </section>
-
-      <section class="card">
-        <h2>Destination</h2>
-        <p class="sub">Pick a platform, then paste its stream key.</p>
-        <div class="chips" id="chips" role="group" aria-label="Platform presets">
-          <button type="button" class="chip" data-url="rtmp://a.rtmp.youtube.com/live2">YouTube</button>
-          <button type="button" class="chip" data-url="rtmps://live-api-s.facebook.com:443/rtmp/">Facebook</button>
-          <button type="button" class="chip" data-url="rtmp://live.twitch.tv/app">Twitch</button>
-          <button type="button" class="chip" data-url="rtmps://fa723fc1b171.global-contribute.live-video.net:443/app">Kick</button>
-          <button type="button" class="chip" data-url="">Custom</button>
-        </div>
-        <div class="field">
-          <label class="f" for="stream_url">Stream URL</label>
-          <input id="stream_url" type="text" placeholder="rtmps://live-api-s.facebook.com:443/rtmp/" required>
-        </div>
-        <div class="field has-eye" style="margin-bottom:0">
-          <label class="f" for="stream_key">Stream key</label>
-          <input id="stream_key" type="password" placeholder="Paste your key" required>
-          <button type="button" class="eye" id="eye" aria-label="Show stream key">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
-          </button>
-        </div>
-      </section>
-    </div>
-
-    <details class="card" id="cookieBox">
-      <summary>YouTube access <span id="cookieState">No cookies saved</span></summary>
-      <div style="padding: 0 24px 24px">
-        <p class="sub" style="margin-bottom:10px">YouTube often blocks cloud servers. Paste your cookies once and this browser remembers them. Use a spare Google account.</p>
-        <ol class="steps">
-          <li>On a computer (or Kiwi Browser), open a private window and sign in to YouTube.</li>
-          <li>Open youtube.com/robots.txt and export them (Cookie-Editor JSON or a cookies.txt file both work).</li>
-          <li>Close the private window, then paste the exported text here.</li>
-        </ol>
-        <textarea id="cookies" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;…" spellcheck="false"></textarea>
-        <div class="row"><span class="sub" style="margin:0">Sent only to your server when you press Run.</span>
-          <button type="button" class="mini" id="clearCookies">Clear cookies</button></div>
-      </div>
-    </details>
-
-    <div class="actions">
-      <button type="submit" class="btn" id="run">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12-7.5a1 1 0 0 0 0-1.72l-12-7.5A1 1 0 0 0 7 4.5z"/></svg>
-        Run
-      </button>
-      <button type="button" class="btn" id="stop" disabled>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="3"/></svg>
-        Stop
-      </button>
-    </div>
-  </form>
-
-  <details class="card" open>
-    <summary>FFmpeg console</summary>
-    <pre id="log">Nothing running.</pre>
-  </details>
-
-  <p class="note">Once it says Live you can close this tab and go offline. The server keeps streaming, and resumes by itself if the link drops, until the video ends or you press Stop.</p>
-</div>
-<div id="toast" role="status"></div>
-
-<script>
-const $ = id => document.getElementById(id);
-let uptime = 0, fetchedAt = Date.now(), running = false;
-
-function toast(text, kind) {
-  const t = $("toast"); t.textContent = text; t.className = "show " + (kind || "");
-  clearTimeout(toast.t); toast.t = setTimeout(() => t.className = "", kind === "err" ? 9000 : 4200);
-}
-const pad = n => String(n).padStart(2, "0");
-function fmt(s) { return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60); }
-
-function tick() { $("timer").textContent = fmt(running ? uptime + Math.floor((Date.now() - fetchedAt) / 1000) : 0); }
-
-async function refresh() {
-  try {
-    const r = await (await fetch("/status")).json();
-    running = r.running; uptime = r.uptime; fetchedAt = Date.now();
-    $("root").classList.toggle("live", r.running);
-    $("state").textContent = r.running ? "ON AIR" : "OFFLINE";
-    $("run").disabled = r.running; $("stop").disabled = !r.running;
-    $("nowLabel").textContent = r.running ? "Now streaming" : (r.exit_code !== null && r.title ? "Last stream ended" : "Nothing is streaming");
-    $("nowTitle").textContent = r.title || "Ready when you are";
-    const src = r.source === "youtube" ? "YouTube" : "Google Drive";
-    $("pillText").textContent = !r.running ? "Server idle"
-      : (r.phase === "reconnecting" ? "Reconnecting to " + src : "Live from " + src)
-        + (r.restarts ? ", resumed " + r.restarts + (r.restarts === 1 ? " time" : " times") : "");
-    $("state").textContent = r.running ? (r.phase === "reconnecting" ? "RETRYING" : "ON AIR") : "OFFLINE";
-    $("prog").textContent = r.running && r.duration ? "Played " + fmt(r.pos) + " of " + fmt(r.duration) : "";
-    if (r.logs.length) {
-      const el = $("log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
-      el.textContent = r.logs.join("\n"); if (atEnd) el.scrollTop = el.scrollHeight;
-    }
-    tick();
-  } catch (e) { /* offline is fine: the server keeps streaming */ }
-}
-
-// source detection
-$("video_url").addEventListener("input", e => {
-  const v = e.target.value, d = $("detect");
-  const yt = /(youtube\.com|youtu\.be)/i.test(v), dr = /(drive|docs)\.google\.com/i.test(v);
-  d.className = "detect " + (yt ? "yt" : dr ? "dr" : "");
-  d.textContent = yt ? "YouTube" : dr ? "Drive" : "";
-  $("qualityField").style.display = dr ? "none" : "";
-});
-
-// ---- remember last values across refreshes
-const FIELDS = ["video_url", "stream_url", "stream_key", "quality", "cookies"];
-const store = {
-  get(k) { try { return localStorage.getItem("sd_" + k); } catch (e) { return null; } },
-  set(k, v) { try { localStorage.setItem("sd_" + k, v); } catch (e) {} }
-};
-const chips = [...document.querySelectorAll(".chip")];
-
-function syncChips() {
-  const cur = $("stream_url").value.trim();
-  let hit = false;
-  chips.forEach(c => { const on = !!c.dataset.url && c.dataset.url === cur; if (on) hit = true; c.setAttribute("aria-pressed", on); });
-  const custom = chips.find(c => !c.dataset.url);
-  custom.setAttribute("aria-pressed", !hit && cur !== "");
-}
-function cookieStatus() {
-  const on = $("cookies").value.trim().length > 20;
-  $("cookieState").textContent = on ? "Cookies saved in this browser" : "No cookies saved";
-  $("cookieState").className = on ? "on" : "";
-}
-
-FIELDS.forEach(k => ["input", "change"].forEach(ev => $(k).addEventListener(ev, () => {
-  store.set(k, $(k).value);
-  if (k === "stream_url") syncChips();
-  if (k === "cookies") cookieStatus();
-})));
-$("loop").addEventListener("change", () => store.set("loop", $("loop").checked ? "1" : "0"));
-
-FIELDS.forEach(k => { const v = store.get(k); if (v !== null) $(k).value = v; });
-$("loop").checked = store.get("loop") === "1";
-$("video_url").dispatchEvent(new Event("input"));
-syncChips(); cookieStatus();
-
-// presets
-chips.forEach(c => c.addEventListener("click", () => {
-  const isPreset = v => chips.some(x => x.dataset.url && x.dataset.url === v);
-  if (c.dataset.url) $("stream_url").value = c.dataset.url;
-  else if (isPreset($("stream_url").value.trim())) $("stream_url").value = "";
-  store.set("stream_url", $("stream_url").value); syncChips();
-  (c.dataset.url ? $("stream_key") : $("stream_url")).focus();
-}));
-
-$("clearCookies").addEventListener("click", () => { $("cookies").value = ""; store.set("cookies", ""); cookieStatus(); toast("Cookies cleared.", "ok"); });
-
-// show/hide key
-$("eye").addEventListener("click", () => {
-  const k = $("stream_key"), show = k.type === "password";
-  k.type = show ? "text" : "password";
-  $("eye").setAttribute("aria-label", show ? "Hide stream key" : "Show stream key");
-});
-
-$("form").addEventListener("submit", async e => {
-  e.preventDefault();
-  $("run").disabled = true; toast("Fetching the video and starting FFmpeg…");
-  try {
-    const res = await fetch("/start", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ video_url: $("video_url").value, stream_url: $("stream_url").value,
-        stream_key: $("stream_key").value, quality: $("quality").value, loop: $("loop").checked,
-        cookies: $("cookies").value }) });
-    const data = await res.json();
-    if (res.ok) { toast("You’re live. You can close this tab.", "ok"); }
-    else {
-      toast(data.error || "Couldn’t start the stream.", "err");
-      if (data.need_cookies) { $("cookieBox").open = true; $("cookieBox").scrollIntoView({ behavior: "smooth", block: "center" }); }
-    }
-  } catch (err) { toast("Couldn’t reach the server.", "err"); }
-  refresh();
-});
-
-$("stop").addEventListener("click", async () => {
-  await fetch("/stop", { method: "POST" }); toast("Stream stopped.", "ok"); refresh();
-});
-
-refresh(); setInterval(refresh, 3000); setInterval(tick, 1000);
-</script>
-</body>
-</html>
-"""
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), threaded=True)

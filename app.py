@@ -55,6 +55,9 @@ KEEP_RE = re.compile(r"error|fail|refus|timed? ?out|invalid|unable|denied|reset|
                      r"server|reconnect|warning|exit|^Input #0|^Output #0", re.I)
 SRC_ERR_RE = re.compile(r"HTTP error 4|Server returned 4|Forbidden|Not Found|\b40[34]\b|\b410\b", re.I)
 ERR_RE = re.compile(r"error|fail|refus|timed? ?out|reset|broken|denied", re.I)
+NOISE_RE = re.compile(r"decode_slice_header|non-existing PPS|no frame!|co located POCs|mmco|"
+                      r"reference picture missing|Invalid NAL|corrupt|concealing|error while decoding|"
+                      r"left block unavailable|top block unavailable", re.I)
 STALL_SECONDS = 60   # no data for this long -> restart that ffmpeg
 MAX_FAILS = 30       # consecutive failed attempts before giving up
 OUT_FAIL_LIMIT = 8   # consecutive "destination refused us" failures before giving up
@@ -70,13 +73,16 @@ TEST_SRC = {"test": True, "urls": [], "live": True, "ua": UA,
             "title": "Test pattern (30 seconds)", "duration": 0}
 
 OVERLAY_PATH = os.path.join(tempfile.gettempdir(), "streamdeck_overlay.png")
+SNAP_CACHE = {}
 
 
-def make_blank_png(w=16, h=9):
+def make_blank_png(w=1280, h=720):
+    """Fully transparent PNG. Same size as the real overlay so ffmpeg's filter never has to reset."""
     def chunk(t, d):
         c = struct.pack(">I", len(d)) + t + d
         return c + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
-    raw = b"".join(b"\x00" + b"\x00\x00\x00\x00" * w for _ in range(h))
+    row = b"\x00" + b"\x00\x00\x00\x00" * w
+    raw = row * h
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
@@ -357,14 +363,17 @@ def build_source_cmd(src, req, start_at, offset, mode):
     if mode == "encode":
         w, h, kb = OUT_Q.get(req.get("oq"), OUT_Q["720"])
         # The overlay PNG is re-read from disk twice a second, so edits show up live.
-        cmd += ["-f", "image2", "-framerate", "2", "-loop", "1", "-re", "-i", OVERLAY_PATH]
-        fc = (f"[0:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,"
-              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p[bg];"
-              f"[{n}:v:0]scale={w}:{h},format=rgba[ov];"
-              "[bg][ov]overlay=0:0:format=auto:eof_action=repeat,format=yuv420p[v]")
+        # NO -re here: on a 2fps input it throttled the whole pipeline to 2fps.
+        cmd += ["-f", "image2", "-framerate", "2", "-loop", "1", "-i", OVERLAY_PATH]
+        fc = (f"[0:v:0]scale={w}:{h}:flags=fast_bilinear:force_original_aspect_ratio=decrease,"
+              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=25,format=yuv420p[bg];"
+              f"[{n}:v:0]scale={w}:{h}:flags=fast_bilinear,format=yuva420p[ov];"
+              "[bg][ov]overlay=0:0:format=yuv420:eof_action=repeat[v]")
         cmd += ["-filter_complex", fc, "-map", "[v]"] + amap
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{kb}k", "-maxrate", f"{kb}k",
-                "-bufsize", f"{kb * 2}k", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-b:v", f"{kb}k", "-maxrate", f"{kb}k", "-bufsize", f"{kb * 2}k",
+                "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+                "-force_key_frames", "expr:gte(t,n_forced*2)",
                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-af", "aresample=async=1"]
     else:
         cmd += ["-map", "0:v:0"] + amap + ["-c", "copy"]
@@ -392,6 +401,8 @@ def pump_src_logs(sess, proc, run):
         line = line[:300]
         if TIME_RE.search(line):
             sess["progress"] = line
+            continue
+        if NOISE_RE.search(line):
             continue
         if SRC_ERR_RE.search(line):
             run["src_err"] = True
@@ -557,6 +568,8 @@ def pump_dest_logs(d, proc, run):
                 run["last_t"], run["beat"] = t, time.time()
             d["progress"] = line
         else:
+            if NOISE_RE.search(line):
+                continue
             if "Error opening output" in line:
                 run["out_fail"] = True
             if ERR_RE.search(line):
@@ -712,6 +725,14 @@ def start():
     test = bool(d.get("test"))
     overlay = bool(d.get("overlay"))
     oq = str(d.get("oq") or "720")
+    if oq not in OUT_Q:
+        oq = "720"
+    if overlay and not test and quality != oq:
+        try:
+            if quality == "best" or int(quality) > int(oq):
+                quality = oq  # decoding 1080p to output 480p only wastes CPU
+        except ValueError:
+            pass
     cookies = d.get("cookies") or ""
     raw = d.get("destinations") or []
 
@@ -822,28 +843,43 @@ def snapshot():
         video_url = (d.get("video_url") or "").strip()
         if not video_url:
             return jsonify(error="Paste a YouTube or Drive link on Home first."), 400
+        hit = SNAP_CACHE.get(video_url)
+        if hit and time.time() - hit[0] < 600:
+            src = hit[1]
+        else:
+            try:
+                kind = detect_source(video_url)
+                src = (resolve_drive(video_url) if kind == "drive"
+                       else resolve_youtube(video_url, "480", d.get("cookies") or ""))
+            except NeedCookies as e:
+                return jsonify(error=str(e), need_cookies=True), 400
+            except ValueError as e:
+                return jsonify(error=str(e)), 400
+            SNAP_CACHE[video_url] = (time.time(), src)
+
+    last = "no output"
+    for nokey, tmo in ((True, 18), (False, 15)):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-user_agent", src["ua"],
+               "-rw_timeout", "15000000"]
+        if not src["live"] and (src.get("duration") or 0) > 6:
+            cmd += ["-ss", "2"]
+        if nokey:
+            cmd += ["-skip_frame", "nokey"]
+        cmd += ["-i", src["urls"][0], "-frames:v", "1", "-an",
+                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease",
+                "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
         try:
-            kind = detect_source(video_url)
-            src = (resolve_drive(video_url) if kind == "drive"
-                   else resolve_youtube(video_url, d.get("quality") or "720", d.get("cookies") or ""))
-        except NeedCookies as e:
-            return jsonify(error=str(e), need_cookies=True), 400
-        except ValueError as e:
-            return jsonify(error=str(e)), 400
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-user_agent", src["ua"],
-           "-rw_timeout", "20000000"]
-    if not src["live"] and (src.get("duration") or 0) > 6:
-        cmd += ["-ss", "2"]
-    cmd += ["-i", src["urls"][0], "-frames:v", "1",
-            "-vf", "scale=1280:720:force_original_aspect_ratio=decrease",
-            "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
-    try:
-        out = subprocess.run(cmd, capture_output=True, timeout=45)
-    except subprocess.TimeoutExpired:
-        return jsonify(error="Grabbing a frame took too long. Try again."), 504
-    if out.returncode != 0 or not out.stdout:
-        return jsonify(error="Couldn't grab a frame from that video."), 502
-    return Response(out.stdout, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+            out = subprocess.run(cmd, capture_output=True, timeout=tmo)
+        except subprocess.TimeoutExpired:
+            last = "timed out (server busy)"
+            continue
+        except Exception as e:
+            return jsonify(error=f"Frame grab failed: {e}"), 500
+        if out.returncode == 0 and out.stdout:
+            return Response(out.stdout, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+        last = (out.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["no output"])[0][:140]
+    SNAP_CACHE.clear()  # link may have expired, resolve again next time
+    return jsonify(error="Couldn't grab a frame: " + last), 502
 
 
 @app.get("/status")
@@ -1142,9 +1178,9 @@ INDEX_HTML = r"""<!doctype html>
       <div class="field" id="oqField" hidden>
         <label class="f" for="oq">Screen mode output</label>
         <select id="oq">
-          <option value="480">480p, 30fps (lightest)</option>
-          <option value="720" selected>720p, 30fps</option>
-          <option value="1080">1080p, 30fps (heavy)</option>
+          <option value="480" selected>480p, 25fps (lightest)</option>
+          <option value="720">720p, 25fps</option>
+          <option value="1080">1080p, 25fps (heavy)</option>
         </select>
       </div>
     </section>
@@ -1753,7 +1789,7 @@ async function grab() {
       body: JSON.stringify({ video_url: u, quality: $("quality").value, cookies: $("cookies").value }) });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      toast(j.error || "Couldn’t grab a frame.", "err");
+      toast(j.error || ("Server didn’t answer in time (code " + res.status + "). It may be busy encoding."), "err");
       if (j.need_cookies) { show("settings"); $("cookieBox").open = true; }
     } else {
       const im = new Image(); im.onload = () => { bgImg = im; render(); toast("Screen updated.", "ok"); };

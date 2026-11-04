@@ -1,7 +1,16 @@
 """
-Stream Deck: restream a YouTube video/live or a Google Drive video to one or many RTMP(S)
-destinations at once (YouTube, Facebook, Twitch, Kick, Rooter, custom) using FFmpeg -c copy.
+Stream Deck v2: restream a YouTube video/live or a Google Drive video to one or many RTMP(S)
+destinations (YouTube, Facebook, Twitch, Kick, Rooter, custom) with FFmpeg.
 Backend + UI live in this one file.
+
+How it avoids cuts: ONE source process feeds a relay, and every platform has its own
+small FFmpeg that only forwards from the relay. If the source link hiccups, only the
+source restarts (timestamps stay continuous) and your platforms stay connected.
+
+Two modes:
+  Direct copy  (default)  -c copy, zero CPU, no overlays.
+  Screen mode  (toggle)   re-encodes ONCE for all platforms and draws your Screen-tab
+                          elements (text, boxes, images) on top, live.
 
 Env vars:
   APP_PASSWORD  protect the page with a login (strongly recommended)
@@ -10,17 +19,21 @@ Env vars:
   YT_PROXY      optional: proxy URL used only to reach YouTube
   KEEPALIVE_URL optional: public URL of this app (auto-detected on Render/Koyeb)
 """
+import io
 import json
 import os
+import queue
 import re
 import secrets
 import socket
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.request
+import zlib
 from collections import deque
 from urllib.parse import urlparse
 
@@ -42,17 +55,40 @@ KEEP_RE = re.compile(r"error|fail|refus|timed? ?out|invalid|unable|denied|reset|
                      r"server|reconnect|warning|exit|^Input #0|^Output #0", re.I)
 SRC_ERR_RE = re.compile(r"HTTP error 4|Server returned 4|Forbidden|Not Found|\b40[34]\b|\b410\b", re.I)
 ERR_RE = re.compile(r"error|fail|refus|timed? ?out|reset|broken|denied", re.I)
-STALL_SECONDS = 60   # no media progress for this long -> restart ffmpeg
+STALL_SECONDS = 60   # no data for this long -> restart that ffmpeg
 MAX_FAILS = 30       # consecutive failed attempts before giving up
 OUT_FAIL_LIMIT = 8   # consecutive "destination refused us" failures before giving up
 MAX_DESTINATIONS = 8
+TS_PKT = 188         # MPEG-TS packet size (relay chunks are always whole packets)
+TS_MARGIN = 3.0      # seconds added to timestamps after a source restart (keeps them rising)
+OUT_Q = {"480": (854, 480, 1400), "720": (1280, 720, 3500), "1080": (1920, 1080, 6000)}
 
 lock = threading.Lock()
-state = {"jobs": {}, "started": None, "title": "", "source": "", "duration": 0,
-         "logs": deque(maxlen=150)}
+state = {"sess": None, "logs": deque(maxlen=150)}
 
 TEST_SRC = {"test": True, "urls": [], "live": True, "ua": UA,
             "title": "Test pattern (30 seconds)", "duration": 0}
+
+OVERLAY_PATH = os.path.join(tempfile.gettempdir(), "streamdeck_overlay.png")
+
+
+def make_blank_png(w=16, h=9):
+    def chunk(t, d):
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + b"\x00\x00\x00\x00" * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def write_overlay(data):
+    tmp = OVERLAY_PATH + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, OVERLAY_PATH)  # atomic: ffmpeg never reads a half-written file
+
+
+write_overlay(make_blank_png())
 
 
 class NeedCookies(ValueError):
@@ -189,35 +225,72 @@ def resolve_youtube(url, quality, cookie_text=""):
 
     fmts = info.get("requested_formats") or [info]
     vcodec = (fmts[0].get("vcodec") or "")
-    if vcodec not in ("", "none") and not vcodec.startswith(("avc1", "h264")):
-        raise ValueError(f"This video only has {vcodec.split('.')[0]} video. "
-                         "-c copy needs H.264; try a lower quality.")
+    # Screen mode re-encodes, so any codec works there; direct copy needs H.264.
     headers = info.get("http_headers") or {}
     return {"urls": [f["url"] for f in fmts], "live": bool(info.get("is_live")),
             "ua": headers.get("User-Agent", UA), "title": info.get("title") or "YouTube video",
+            "vcodec": vcodec,
             "duration": 0 if info.get("is_live") else int(info.get("duration") or 0)}
 
 
-def resolve_source(job):
-    if job["kind"] == "test":
+def resolve_source(req):
+    if req["kind"] == "test":
         return dict(TEST_SRC)
-    if job["kind"] == "drive":
-        return resolve_drive(job["video_url"])
-    return resolve_youtube(job["video_url"], job["quality"], job["cookies"])
+    if req["kind"] == "drive":
+        return resolve_drive(req["video_url"])
+    return resolve_youtube(req["video_url"], req["quality"], req["cookies"])
 
 
-# ---------------------------------------------------------------- ffmpeg helpers
+# ---------------------------------------------------------------- helpers
 def is_running():
-    return any(j["active"] for j in state["jobs"].values())
+    s = state["sess"]
+    return bool(s and s["active"])
 
 
-def log(msg, job=None):
-    state["logs"].append(f"{job['name']} | {msg}" if job else msg)
+def log(msg, tag=None):
+    state["logs"].append(f"{tag} | {msg}" if tag else msg)
 
 
 def hms(sec):
     sec = int(sec)
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def nap(sess, seconds, d=None):
+    for _ in range(int(seconds)):
+        if sess["stop"] or (d and d["stop"]):
+            return
+        time.sleep(1)
+
+
+def kill_proc(p):
+    try:
+        if p and p.poll() is None:
+            p.terminate()
+    except OSError:
+        pass
+
+
+def wait_proc(p, t=8):
+    try:
+        p.wait(timeout=t)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+
+
+def d_put(d, data):
+    """Hand a chunk to a destination. Never blocks: if that platform is slow, drop its oldest chunk."""
+    q = d["q"]
+    while True:
+        try:
+            q.put_nowait(data)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
 
 
 def diagnose(output):
@@ -256,174 +329,348 @@ def normalize_stream_url(url):
     return f"{p.scheme}://{host}:{port}{path}"
 
 
-def build_cmd(src, output, loop, start_at=0.0):
-    if src.get("test"):  # small colour bars + tone, to check a destination accepts us
-        return ["ffmpeg", "-hide_banner", "-loglevel", "info",
-                "-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15",
-                "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
-                "-t", "30", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-g", "30", "-pix_fmt", "yuv420p", "-b:v", "600k",
-                "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-f", "flv", output]
+# ---------------------------------------------------------------- ffmpeg command lines
+def build_source_cmd(src, req, start_at, offset, mode):
+    """One ffmpeg that reads the video and writes MPEG-TS to stdout (the relay)."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info"]
+    if src.get("test"):  # colour bars + tone, to check a destination accepts us
+        return cmd + ["-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15",
+                      "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                      "-t", "30", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                      "-g", "30", "-pix_fmt", "yuv420p", "-b:v", "600k",
+                      "-c:a", "aac", "-b:a", "96k", "-ar", "44100",
+                      "-flush_packets", "1", "-f", "mpegts", "pipe:1"]
+    live = src["live"]
     for url in src["urls"]:
         cmd += ["-user_agent", src["ua"], "-thread_queue_size", "512",
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-        if start_at > 0 and not src["live"]:
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                "-rw_timeout", "20000000", "-fflags", "+genpts+discardcorrupt"]
+        if start_at > 0 and not live:
             cmd += ["-ss", f"{start_at:.2f}"]
-        if loop and not src["live"]:
+        if req["loop"] and not live:
             cmd += ["-stream_loop", "-1"]
-        if not src["live"]:
+        if not live:
             cmd += ["-re"]
         cmd += ["-i", url]
-    if len(src["urls"]) == 2:
-        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    n = len(src["urls"])
+    amap = ["-map", "1:a:0"] if n == 2 else ["-map", "0:a:0?"]
+    if mode == "encode":
+        w, h, kb = OUT_Q.get(req.get("oq"), OUT_Q["720"])
+        # The overlay PNG is re-read from disk twice a second, so edits show up live.
+        cmd += ["-f", "image2", "-framerate", "2", "-loop", "1", "-re", "-i", OVERLAY_PATH]
+        fc = (f"[0:v:0]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p[bg];"
+              f"[{n}:v:0]scale={w}:{h},format=rgba[ov];"
+              "[bg][ov]overlay=0:0:format=auto:eof_action=repeat,format=yuv420p[v]")
+        cmd += ["-filter_complex", fc, "-map", "[v]"] + amap
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{kb}k", "-maxrate", f"{kb}k",
+                "-bufsize", f"{kb * 2}k", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-af", "aresample=async=1"]
     else:
-        cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-    cmd += ["-c", "copy", "-flvflags", "no_duration_filesize", "-f", "flv", output]
+        cmd += ["-map", "0:v:0"] + amap + ["-c", "copy"]
+    if offset > 0:
+        cmd += ["-output_ts_offset", f"{offset:.2f}"]
+    cmd += ["-flush_packets", "1", "-mpegts_flags", "+resend_headers", "-f", "mpegts", "pipe:1"]
     return cmd
 
 
-def pump_logs(job, proc, base, run):
-    for line in proc.stderr:
+def build_dest_cmd(output):
+    """One small ffmpeg per platform: relay in on stdin, RTMP out. Never touches the video."""
+    return ["ffmpeg", "-hide_banner", "-loglevel", "info", "-fflags", "+genpts",
+            "-analyzeduration", "2000000", "-probesize", "2000000", "-f", "mpegts", "-i", "pipe:0",
+            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+            "-flvflags", "no_duration_filesize", "-f", "flv", output]
+
+
+# ---------------------------------------------------------------- source side
+def pump_src_logs(sess, proc, run):
+    err = io.TextIOWrapper(proc.stderr, encoding="utf-8", errors="replace")
+    for line in err:
         line = line.strip()
         if not line:
             continue
-        line = line.replace(job["key"], "****")[:300]
-        m = TIME_RE.search(line)
-        if m:
-            t = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
-            job["pos"] = base + t
-            if t > run["last_t"]:
-                run["last_t"], run["beat"] = t, time.time()
-            job["progress"] = line
-        else:
-            if "Error opening output" in line:
-                run["out_fail"] = True
-            if SRC_ERR_RE.search(line):
-                run["src_err"] = True
-            if ERR_RE.search(line):
-                run["last_err"] = line[:160]
-            if KEEP_RE.search(line):
-                log(line, job)
+        line = line[:300]
+        if TIME_RE.search(line):
+            sess["progress"] = line
+            continue
+        if SRC_ERR_RE.search(line):
+            run["src_err"] = True
+        if ERR_RE.search(line):
+            run["last_err"] = line[:160]
+        if KEEP_RE.search(line):
+            log(line, "source")
 
 
-def nap(job, seconds):
-    for _ in range(int(seconds)):
-        if job["stop"]:
-            return
-        time.sleep(1)
+def pump_data(sess, proc, run):
+    """Read MPEG-TS from the source and fan it out, always in whole 188-byte packets."""
+    fd = proc.stdout.fileno()
+    rem = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf = rem + chunk
+        n = len(buf) - len(buf) % TS_PKT
+        rem = buf[n:]
+        if not n:
+            continue
+        data = buf[:n]
+        now = time.time()
+        run["last"] = now
+        run["beat"] = now
+        if run["first"] is None:
+            run["first"] = now
+        sess["last_chunk"] = now
+        for d in list(sess["dests"].values()):
+            if d["active"]:
+                d_put(d, data)
 
 
-def resume_point(job, src):
-    if src["live"] or job["pos"] < 5:
+def resume_point(sess, src, req):
+    if src["live"] or sess["pos"] < 5:
         return 0.0
-    pos = job["pos"] - 3  # replay a few seconds so nothing is skipped
+    pos = sess["pos"] - 3  # replay a few seconds so nothing is skipped
     dur = src.get("duration") or 0
-    if job["loop"]:
+    if req["loop"]:
         return (pos % dur) if dur else 0.0
     return max(0.0, pos)
 
 
-def supervise(job, src):
-    """Run ffmpeg for one destination and keep it running: if it drops or stalls, resume."""
-    fails, out_fails, first, rc, reuse = 0, 0, True, None, False
+def run_source(sess):
+    """Keep the single source running. A drop here never disconnects any platform."""
+    req = sess["req"]
+    src = sess["src"]
+    fails, first, rc, reuse, runs = 0, True, None, False, 0
     try:
-        while not job["stop"]:
+        while not sess["stop"]:
             if not first:
-                job["phase"] = "reconnecting"
-            if not first and not reuse:
-                try:
-                    src = resolve_source(job)
-                except ValueError as e:
-                    fails += 1
-                    log(f"[could not refresh the video link: {e}]", job)
-                    if fails > MAX_FAILS:
-                        break
-                    nap(job, min(5 + 3 * fails, 30))
-                    continue
+                sess["phase"] = "reconnecting"
+                if not reuse:
+                    try:
+                        src = resolve_source(req)
+                        sess["src"] = src
+                    except ValueError as e:
+                        fails += 1
+                        log(f"[could not refresh the video link: {e}]", "source")
+                        if fails > MAX_FAILS:
+                            break
+                        nap(sess, min(5 + 3 * fails, 30))
+                        continue
             first = False
             dur = src.get("duration") or 0
-            start_at = resume_point(job, src)
-            cmd = build_cmd(src, job["output"], job["loop"], start_at)
-            run = {"last_t": -1.0, "beat": time.time()}
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                errors="replace", bufsize=1, start_new_session=True)
-            job["proc"] = proc
-            job["phase"] = "streaming"
-            reader = threading.Thread(target=pump_logs, args=(job, proc, start_at, run), daemon=True)
-            reader.start()
+            start_at = resume_point(sess, src, req)
+            offset = 0.0 if runs == 0 else time.time() - sess["t0"] + TS_MARGIN
+            runs += 1
+            cmd = build_source_cmd(src, req, start_at, offset, sess["mode"])
+            run = {"beat": time.time(), "first": None, "last": None, "src_err": False, "last_err": ""}
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+            sess["proc"] = proc
+            sess["phase"] = "streaming"
+            t1 = threading.Thread(target=pump_src_logs, args=(sess, proc, run), daemon=True)
+            t2 = threading.Thread(target=pump_data, args=(sess, proc, run), daemon=True)
+            t1.start()
+            t2.start()
 
             while proc.poll() is None:
-                if job["stop"]:
+                if sess["stop"]:
                     break
-                if time.time() - run["beat"] > STALL_SECONDS:
-                    log(f"[no progress for {STALL_SECONDS}s, restarting ffmpeg]", job)
+                now = time.time()
+                if run["first"] and not src["live"]:
+                    sess["pos"] = start_at + (now - run["first"])
+                if now - run["beat"] > STALL_SECONDS:
+                    log(f"[no video data for {STALL_SECONDS}s, restarting the source]", "source")
                     proc.kill()
                     break
                 time.sleep(1)
-            proc.wait()
-            reader.join(timeout=3)
+            if sess["stop"]:
+                kill_proc(proc)
+            wait_proc(proc)
+            t1.join(timeout=3)
+            t2.join(timeout=3)
             rc = proc.returncode
-            if job["stop"]:
+            if sess["stop"]:
                 break
 
-            if job["loop"]:
+            run_len = (run["last"] - run["first"]) if run["first"] and run["last"] else 0
+            if req["loop"]:
                 complete = False
             elif src.get("test"):
                 complete = rc == 0
             elif src["live"]:
                 complete = rc == 0
                 if complete:
-                    # ffmpeg exiting cleanly can just be a hiccup: only stop if the live is really over
+                    # a clean exit can just be a hiccup: only stop if the live is really over
                     try:
-                        fresh = resolve_source(job)
+                        fresh = resolve_source(req)
                     except ValueError:
                         fresh = None
                     if fresh is not None and fresh.get("live"):
                         complete = False
                         src = fresh
+                        sess["src"] = fresh
             elif dur:
-                complete = job["pos"] >= dur - 8
+                complete = sess["pos"] >= dur - 8
             else:
                 complete = rc == 0
             if complete:
-                log("[finished: the video played to the end]", job)
+                log("[finished: the video played to the end]", "source")
                 break
 
-            if run.get("out_fail"):
+            fails = 0 if run_len >= 20 else fails + 1
+            if fails > MAX_FAILS:
+                log("[source gave up after repeated failures]", "source")
+                break
+            wait = min(2 + 3 * fails, 30)
+            sess["restarts"] += 1
+            reuse = run_len >= 5 and not run["src_err"]
+            why = f": {run['last_err']}" if run["last_err"] else ""
+            log(f"[source dropped (code {rc}){why}; resuming in {wait}s, platforms stay connected]", "source")
+            nap(sess, wait)
+    except Exception as e:  # never let a supervisor die silently
+        log(f"[source error: {e}]", "source")
+    finally:
+        sess["src_done"] = True
+        sess["phase"] = ""
+        if sess["user_stop"]:
+            log("[stopped]")
+        elif not sess["stop"]:
+            for d in list(sess["dests"].values()):
+                d_put(d, None)  # tell every platform the video is over
+
+
+# ---------------------------------------------------------------- destination side
+def pump_dest_logs(d, proc, run):
+    err = io.TextIOWrapper(proc.stderr, encoding="utf-8", errors="replace")
+    for line in err:
+        line = line.strip()
+        if not line:
+            continue
+        line = line.replace(d["key"], "****")[:300]
+        m = TIME_RE.search(line)
+        if m:
+            t = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+            if t > run.get("last_t", -1.0):
+                run["last_t"], run["beat"] = t, time.time()
+            d["progress"] = line
+        else:
+            if "Error opening output" in line:
+                run["out_fail"] = True
+            if ERR_RE.search(line):
+                run["last_err"] = line[:160]
+            if KEEP_RE.search(line):
+                log(line, d["name"])
+
+
+def dest_writer(d, proc):
+    q = d["q"]
+    try:
+        while proc.poll() is None:
+            try:
+                data = q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if data is None:
+                d["eof"] = True
+                break
+            proc.stdin.write(data)
+            proc.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+
+def dest_done(sess, d):
+    d["active"] = False
+    d["phase"] = ""
+    d["progress"] = ""
+    if not any(x["active"] for x in sess["dests"].values()):
+        sess["active"] = False
+        sess["stop"] = True
+        kill_proc(sess.get("proc"))
+
+
+def run_dest(sess, d):
+    """Keep one platform connected. Only this platform restarts when its connection drops."""
+    tag = d["name"]
+    fails, out_fails, first, rc = 0, 0, True, None
+    try:
+        while not sess["stop"] and not d["stop"]:
+            if not first:
+                d["phase"] = "reconnecting"
+                while not d["eof"]:  # drop stale video so we rejoin at the live edge
+                    try:
+                        if d["q"].get_nowait() is None:
+                            d["eof"] = True
+                    except queue.Empty:
+                        break
+            first = False
+            run = {"beat": time.time(), "started": time.time(), "out_fail": False,
+                   "last_err": "", "last_t": -1.0}
+            proc = subprocess.Popen(build_dest_cmd(d["output"]), stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+            d["proc"] = proc
+            d["phase"] = "streaming"
+            rd = threading.Thread(target=pump_dest_logs, args=(d, proc, run), daemon=True)
+            wr = threading.Thread(target=dest_writer, args=(d, proc), daemon=True)
+            rd.start()
+            wr.start()
+
+            while proc.poll() is None:
+                if sess["stop"] or d["stop"]:
+                    break
+                now = time.time()
+                if now - sess["last_chunk"] < 10 and now - run["beat"] > STALL_SECONDS:
+                    log(f"[no progress for {STALL_SECONDS}s, restarting this connection]", tag)
+                    proc.kill()
+                    break
+                time.sleep(1)
+            if sess["stop"] or d["stop"]:
+                kill_proc(proc)
+            wait_proc(proc)
+            rd.join(timeout=3)
+            wr.join(timeout=3)
+            rc = proc.returncode
+            if sess["stop"] or d["stop"]:
+                break
+            if d["eof"]:
+                log("[finished]", tag)
+                break
+
+            if run["out_fail"]:
                 out_fails += 1
                 if out_fails in (1, 4):
-                    log(diagnose(job["output"]), job)
+                    log(diagnose(d["output"]), tag)
                 if out_fails >= OUT_FAIL_LIMIT:
                     log("[this platform keeps refusing the connection, so I stopped it. Get a "
                         "fresh URL and key from the platform, wait until it is ready, then "
-                        "press Run again]", job)
+                        "press Run again]", tag)
                     break
             else:
                 out_fails = 0
 
-            fails = 0 if run["last_t"] >= 20 else fails + 1
+            fails = 0 if time.time() - run["started"] >= 20 else fails + 1
             if fails > MAX_FAILS:
-                log("[giving up after repeated failures]", job)
+                log("[giving up after repeated failures]", tag)
                 break
             wait = min(2 + 3 * fails, 30)
-            job["restarts"] += 1
-            # Streamed fine for a while and the video link isn't the problem: reconnect at once
-            # with the same links, so the platform keeps treating it as one continuous stream.
-            reuse = run["last_t"] >= 5 and not run.get("src_err")
-            why = f": {run['last_err']}" if run.get("last_err") else ""
-            log(f"[stream dropped (code {rc}){why}; reconnecting from {hms(job['pos'])} in {wait}s]", job)
-            nap(job, wait)
-    except Exception as e:  # never let a supervisor die silently
-        log(f"[supervisor error: {e}]", job)
+            d["restarts"] += 1
+            why = f": {run['last_err']}" if run["last_err"] else ""
+            log(f"[connection dropped (code {rc}){why}; reconnecting in {wait}s]", tag)
+            nap(sess, wait, d)
+    except Exception as e:
+        log(f"[error: {e}]", tag)
     finally:
-        job["active"] = False
-        job["phase"] = ""
-        job["progress"] = ""
-        job["exit_code"] = rc
-        if job["stop"]:
-            log("[stopped]", job)
+        d["exit_code"] = rc
+        dest_done(sess, d)
 
 
 def keepalive():
@@ -463,6 +710,8 @@ def start():
     quality = d.get("quality") or "1080"
     loop = bool(d.get("loop"))
     test = bool(d.get("test"))
+    overlay = bool(d.get("overlay"))
+    oq = str(d.get("oq") or "720")
     cookies = d.get("cookies") or ""
     raw = d.get("destinations") or []
 
@@ -503,56 +752,122 @@ def start():
     except ValueError as e:
         return jsonify(error=str(e)), 400
 
+    mode = "test" if test else ("encode" if overlay else "copy")
+    if mode == "copy":
+        vc = src.get("vcodec") or ""
+        if vc not in ("", "none") and not vc.startswith(("avc1", "h264")):
+            return jsonify(error=f"This video only has {vc.split('.')[0]} video. Direct copy needs "
+                                 "H.264: turn on Screen mode (it re-encodes) or pick a lower quality."), 400
+
+    req = {"kind": kind, "video_url": video_url, "quality": quality, "cookies": cookies,
+           "loop": loop, "oq": oq}
     with lock:
         if is_running():
             return jsonify(error="A stream is already running. Stop it first."), 409
-        state["jobs"] = {}
-        state.update(started=time.time(), title=src["title"], source=kind,
-                     duration=src.get("duration") or 0)
+        now = time.time()
+        sess = {"stop": False, "user_stop": False, "active": True, "started": now, "t0": now,
+                "title": src["title"], "source": kind, "duration": src.get("duration") or 0,
+                "src": src, "req": req, "mode": mode, "pos": 0.0, "phase": "streaming",
+                "restarts": 0, "last_chunk": now, "proc": None, "progress": "",
+                "src_done": False, "dests": {}}
+        state["sess"] = sess
         state["logs"].clear()
         for x in dests:
-            job = {"id": x["id"], "name": x["name"], "key": x["key"], "output": x["output"],
-                   "active": True, "stop": False, "proc": None, "pos": 0.0, "kind": kind,
-                   "video_url": video_url, "quality": quality, "cookies": cookies, "loop": loop,
-                   "phase": "streaming", "restarts": 0, "progress": "", "exit_code": None}
-            state["jobs"][x["id"]] = job
-            threading.Thread(target=supervise, args=(job, src), daemon=True).start()
-    return jsonify(ok=True, title=src["title"], count=len(dests))
+            sess["dests"][x["id"]] = {
+                "id": x["id"], "name": x["name"], "key": x["key"], "output": x["output"],
+                "active": True, "stop": False, "eof": False, "proc": None,
+                "q": queue.Queue(maxsize=300), "phase": "streaming", "restarts": 0,
+                "progress": "", "exit_code": None}
+        for dd in sess["dests"].values():
+            threading.Thread(target=run_dest, args=(sess, dd), daemon=True).start()
+        threading.Thread(target=run_source, args=(sess,), daemon=True).start()
+    return jsonify(ok=True, title=src["title"], count=len(dests), mode=mode)
 
 
 @app.post("/stop")
 def stop():
-    jobs = list(state["jobs"].values())
-    for job in jobs:
-        if job["active"]:
-            job["stop"] = True
-    for job in jobs:
-        proc = job.get("proc")
-        if job["stop"] and proc and proc.poll() is None:
-            proc.terminate()
-    for job in jobs:
-        proc = job.get("proc")
-        if job["stop"] and proc:
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+    s = state["sess"]
+    if s and s["active"]:
+        s["user_stop"] = True
+        s["stop"] = True
+        dl = list(s["dests"].values())
+        for dd in dl:
+            dd["stop"] = True
+        procs = [s.get("proc")] + [dd.get("proc") for dd in dl]
+        for p in procs:
+            kill_proc(p)
+        for p in procs:
+            if p:
+                wait_proc(p)
+        s["active"] = False
     return jsonify(ok=True)
+
+
+@app.post("/overlay")
+def overlay():
+    data = request.get_data(cache=False)
+    if not data.startswith(b"\x89PNG") or len(data) > 8_000_000:
+        return jsonify(error="That overlay image wasn't valid."), 400
+    write_overlay(data)
+    return jsonify(ok=True)
+
+
+@app.post("/snapshot")
+def snapshot():
+    """One frame of the source (no overlays), so you can place elements on the real picture."""
+    d = request.get_json(silent=True) or {}
+    s = state["sess"]
+    src = s["src"] if (s and s["active"] and not s["src"].get("test")) else None
+    if src is None:
+        video_url = (d.get("video_url") or "").strip()
+        if not video_url:
+            return jsonify(error="Paste a YouTube or Drive link on Home first."), 400
+        try:
+            kind = detect_source(video_url)
+            src = (resolve_drive(video_url) if kind == "drive"
+                   else resolve_youtube(video_url, d.get("quality") or "720", d.get("cookies") or ""))
+        except NeedCookies as e:
+            return jsonify(error=str(e), need_cookies=True), 400
+        except ValueError as e:
+            return jsonify(error=str(e)), 400
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-user_agent", src["ua"],
+           "-rw_timeout", "20000000"]
+    if not src["live"] and (src.get("duration") or 0) > 6:
+        cmd += ["-ss", "2"]
+    cmd += ["-i", src["urls"][0], "-frames:v", "1",
+            "-vf", "scale=1280:720:force_original_aspect_ratio=decrease",
+            "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return jsonify(error="Grabbing a frame took too long. Try again."), 504
+    if out.returncode != 0 or not out.stdout:
+        return jsonify(error="Couldn't grab a frame from that video."), 502
+    return Response(out.stdout, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/status")
 def status():
-    jobs = list(state["jobs"].values())
-    running = any(j["active"] for j in jobs)
+    s = state["sess"]
+    running = bool(s and s["active"])
+    dl = list(s["dests"].values()) if s else []
     logs = list(state["logs"])
-    logs += [f"{j['name']} | {j['progress']}" for j in jobs if j["active"] and j["progress"]]
+    if running:
+        if s["progress"]:
+            logs.append(f"source | {s['progress']}")
+        logs += [f"{x['name']} | {x['progress']}" for x in dl if x["active"] and x["progress"]]
+    pos = int(s["pos"]) if s else 0
+    if s and s["req"]["loop"] and s["duration"]:
+        pos %= s["duration"]
     return jsonify(
         running=running,
-        uptime=int(time.time() - state["started"]) if running and state["started"] else 0,
-        title=state["title"], source=state["source"], duration=state["duration"],
-        pos=int(max([j["pos"] for j in jobs if j["active"]] or [0])),
-        dests=[{"id": j["id"], "name": j["name"], "active": j["active"], "phase": j["phase"],
-                "restarts": j["restarts"]} for j in jobs],
+        uptime=int(time.time() - s["started"]) if running else 0,
+        title=s["title"] if s else "", source=s["source"] if s else "",
+        duration=s["duration"] if s else 0, pos=pos,
+        mode=s["mode"] if s else "", src_phase=s["phase"] if running else "",
+        restarts=s["restarts"] if s else 0,
+        dests=[{"id": x["id"], "name": x["name"], "active": x["active"], "phase": x["phase"],
+                "restarts": x["restarts"]} for x in dl],
         logs=logs)
 
 
@@ -573,6 +888,7 @@ INDEX_HTML = r"""<!doctype html>
     --r-xl: 32px; --r-lg: 22px; --r-md: 16px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display: none !important; }
   html { background: var(--bg); }
   body {
     margin: 0; min-height: 100vh; color: var(--text);
@@ -597,14 +913,12 @@ INDEX_HTML = r"""<!doctype html>
   h2 { font-size: 1.05rem; font-weight: 700; margin-bottom: 4px; }
   .sub { color: var(--muted); font-size: .9rem; margin-bottom: 18px; }
 
-  /* top bar */
   .top { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
   .logo { width: 44px; height: 44px; border-radius: 15px; display: grid; place-items: center;
     background: linear-gradient(135deg, var(--hot), var(--amber)); box-shadow: 0 10px 28px -8px var(--hot); }
   .top h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.02em; }
   .top span { color: var(--muted); font-size: .85rem; display: block; margin-top: -2px; }
 
-  /* hero */
   .hero { display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: center; }
   .ring { width: 150px; height: 150px; position: relative; display: grid; place-items: center; }
   .ring::before {
@@ -629,7 +943,6 @@ INDEX_HTML = r"""<!doctype html>
   .pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
   .live .pill i { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
 
-  /* fields */
   label.f { display: block; font-size: .85rem; font-weight: 500; color: var(--muted); margin: 0 0 8px 4px; }
   .field { position: relative; margin-bottom: 18px; }
   input[type=text], input[type=url], input[type=password], select {
@@ -661,7 +974,8 @@ INDEX_HTML = r"""<!doctype html>
   .chip:hover { background: rgba(255,255,255,.13); }
 
   .toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer;
-    padding: 12px 16px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); }
+    padding: 12px 16px; border-radius: var(--r-md); background: rgba(8,4,22,.55); border: 1px solid var(--stroke); position: relative; }
+  .toggle + .toggle, .toggle + .field { margin-top: 12px; }
   .toggle b { font-weight: 500; font-size: .95rem; }
   .toggle small { color: var(--muted); display: block; font-size: .8rem; }
   .toggle input { position: absolute; opacity: 0; pointer-events: none; }
@@ -678,7 +992,6 @@ INDEX_HTML = r"""<!doctype html>
   .mini:disabled { opacity: .4; cursor: not-allowed; }
   .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 
-  /* platform picker */
   .plist { display: grid; gap: 12px; }
   .plat { display: flex; align-items: center; gap: 14px; width: 100%; text-align: left; font: inherit; color: var(--text);
     padding: 14px 16px; border-radius: var(--r-lg); cursor: pointer; border: 2px solid transparent;
@@ -703,7 +1016,6 @@ INDEX_HTML = r"""<!doctype html>
   .empty { text-align: center; padding: 26px 12px; color: var(--muted); border: 2px dashed var(--stroke); border-radius: var(--r-lg); }
   .empty p { margin-bottom: 14px; }
 
-  /* settings list */
   .srow { padding: 14px 16px; border-radius: var(--r-lg); background: rgba(8,4,22,.45); border: 1px solid var(--stroke); }
   .srow .top2 { display: flex; align-items: center; gap: 14px; }
   .srow .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -713,7 +1025,6 @@ INDEX_HTML = r"""<!doctype html>
   #cookieState { font-size: .85rem; color: var(--muted); font-weight: 400; }
   #cookieState.on { color: var(--ok); }
 
-  /* actions */
   .actions { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
   .btn { font: inherit; font-weight: 700; font-size: 1.08rem; padding: 18px 24px; border-radius: 22px; border: 0; cursor: pointer;
     display: flex; align-items: center; justify-content: center; gap: 10px; transition: transform .15s, box-shadow .2s, opacity .2s; }
@@ -726,7 +1037,6 @@ INDEX_HTML = r"""<!doctype html>
   #stop { color: var(--text); background: rgba(255,255,255,.08); border: 1px solid var(--stroke); }
   #stop:hover:not(:disabled) { background: rgba(255,51,102,.22); border-color: var(--hot); }
 
-  /* console */
   details.card { padding: 0; }
   summary { cursor: pointer; padding: 20px 24px; font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   summary::-webkit-details-marker { display: none; }
@@ -739,15 +1049,14 @@ INDEX_HTML = r"""<!doctype html>
     max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
   .note { color: var(--muted); font-size: .82rem; text-align: center; padding: 0 12px; }
 
-  /* bottom navigation */
   .nav { position: fixed; z-index: 8; left: 50%; transform: translateX(-50%);
-    bottom: calc(14px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px));
-    display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 6px; border-radius: 30px;
+    bottom: calc(14px + env(safe-area-inset-bottom)); width: min(460px, calc(100vw - 32px));
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; padding: 6px; border-radius: 30px;
     background: rgba(24,16,52,.78); border: 1px solid var(--stroke);
     backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
     box-shadow: 0 20px 50px -12px rgba(0,0,0,.85); }
-  .nav button { font: inherit; font-weight: 700; font-size: .95rem; color: var(--muted); border: 0; background: transparent;
-    border-radius: 24px; padding: 12px 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
+  .nav button { font: inherit; font-weight: 700; font-size: .88rem; color: var(--muted); border: 0; background: transparent;
+    border-radius: 24px; padding: 12px 4px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;
     transition: all .2s; }
   .nav button[aria-current=page] { color: #1b0a12; background: linear-gradient(120deg, var(--hot), var(--amber));
     box-shadow: 0 10px 26px -10px rgba(255,51,102,.8); }
@@ -758,6 +1067,21 @@ INDEX_HTML = r"""<!doctype html>
     border: 1px solid var(--stroke); box-shadow: 0 18px 50px -10px rgba(0,0,0,.8); transition: transform .35s cubic-bezier(.2,.9,.3,1.2); }
   #toast.show { transform: translate(-50%, 0); }
   #toast.err { border-color: var(--hot); } #toast.ok { border-color: var(--ok); }
+
+  /* screen editor */
+  .stage { border-radius: var(--r-lg); overflow: hidden; border: 1px solid var(--stroke); background: #0b0720; line-height: 0; }
+  #cv { width: 100%; height: auto; display: block; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  .badge { font-size: .82rem; padding: 8px 14px; border-radius: 14px; margin-bottom: 12px; border: 1px solid var(--stroke); background: rgba(255,255,255,.06); color: var(--muted); }
+  .badge.on { color: var(--ok); border-color: rgba(62,232,154,.4); }
+  .badge.warn { color: var(--amber); border-color: rgba(255,171,46,.4); }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .pgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  .pr { margin-bottom: 14px; }
+  .pgrid > div, .pr { min-width: 0; }
+  input[type=range] { width: 100%; accent-color: var(--hot); }
+  input[type=color] { width: 100%; height: 44px; border: 1px solid var(--stroke); border-radius: 12px; background: rgba(8,4,22,.55); padding: 4px; }
+  .cb { display: flex; align-items: center; gap: 8px; font-size: .85rem; color: var(--muted); margin-top: 6px; }
+  #p_text { font: 15px/1.4 "Space Grotesk", system-ui, sans-serif; min-height: 70px; }
 
   @media (max-width: 720px) {
     .hero { grid-template-columns: 1fr; justify-items: center; text-align: center; }
@@ -811,6 +1135,18 @@ INDEX_HTML = r"""<!doctype html>
         <span><b>Loop the video</b><small>Restart when it ends (not for live sources)</small></span>
         <input type="checkbox" id="loop"><span class="sw"></span>
       </label>
+      <label class="toggle">
+        <span><b>Screen mode</b><small>Shows your Screen-tab text, boxes and images on the live. Re-encodes once for all platforms (uses CPU). Off = direct copy.</small></span>
+        <input type="checkbox" id="ovmode"><span class="sw"></span>
+      </label>
+      <div class="field" id="oqField" hidden>
+        <label class="f" for="oq">Screen mode output</label>
+        <select id="oq">
+          <option value="480">480p, 30fps (lightest)</option>
+          <option value="720" selected>720p, 30fps</option>
+          <option value="1080">1080p, 30fps (heavy)</option>
+        </select>
+      </div>
     </section>
 
     <section class="card">
@@ -841,7 +1177,53 @@ INDEX_HTML = r"""<!doctype html>
       <pre id="log">Nothing running.</pre>
     </details>
 
-    <p class="note">Once it says ON AIR you can close this tab and go offline. The server keeps streaming, resumes by itself if a link drops, and stops when the video ends or you press Stop.</p>
+    <p class="note">Once it says ON AIR you can close this tab and go offline. The server keeps streaming. If the source link drops it resumes by itself and your platforms stay connected, so there is no cut on their side.</p>
+  </main>
+
+  <!-- ================= SCREEN ================= -->
+  <main class="view" id="view-screen">
+    <section class="card">
+      <div class="head">
+        <div><h2>Screen</h2><p class="sub" style="margin-bottom:12px">Drag elements onto the picture. Pinch-free: drag to move, corner dot to resize, top dot to rotate.</p></div>
+        <button type="button" class="mini" id="grab">Grab live frame</button>
+      </div>
+      <div class="badge warn" id="ovBadge"></div>
+      <div class="stage"><canvas id="cv"></canvas></div>
+      <div class="tools">
+        <button type="button" class="chip" data-add="text">+ Text</button>
+        <button type="button" class="chip" data-add="rect">+ Rectangle</button>
+        <button type="button" class="chip" data-add="round">+ Rounded box</button>
+        <button type="button" class="chip" data-add="circle">+ Circle</button>
+        <button type="button" class="chip" id="addImg">+ Image</button>
+        <button type="button" class="chip" id="clearAll">Clear all</button>
+        <input type="file" id="imgFile" accept="image/*" hidden>
+      </div>
+    </section>
+
+    <section class="card" id="props" hidden>
+      <div class="head"><h2 id="propTitle">Selected</h2><button type="button" class="mini danger" id="pDel">Delete</button></div>
+      <div class="pr" data-for="text rect round circle">
+        <label class="f" for="p_text">Text</label><textarea id="p_text" spellcheck="false"></textarea>
+      </div>
+      <div class="pgrid">
+        <div data-for="text rect round circle"><label class="f" for="p_fs">Text size</label><input type="range" id="p_fs" min="12" max="200"></div>
+        <div data-for="text rect round circle"><label class="f" for="p_color">Text color</label><input type="color" id="p_color"></div>
+        <div data-for="text rect round circle"><label class="f" for="p_fill">Fill color</label><input type="color" id="p_fill">
+          <label class="cb"><input type="checkbox" id="p_fillOn"> Filled</label></div>
+        <div><label class="f" for="p_op">Opacity</label><input type="range" id="p_op" min="5" max="100"></div>
+        <div><label class="f" for="p_sw">Border width</label><input type="range" id="p_sw" min="0" max="24"></div>
+        <div><label class="f" for="p_stroke">Border color</label><input type="color" id="p_stroke"></div>
+        <div data-for="rect round"><label class="f" for="p_r">Corner radius</label><input type="range" id="p_r" min="0" max="200"></div>
+        <div data-for="text rect round circle"><label class="f" for="p_align">Align</label>
+          <select id="p_align"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select>
+          <label class="cb"><input type="checkbox" id="p_bold"> Bold</label></div>
+      </div>
+      <div class="tools" style="margin-top:0">
+        <button type="button" class="mini" id="pDup">Duplicate</button>
+        <button type="button" class="mini" id="pFront">To front</button>
+        <button type="button" class="mini" id="pBack">To back</button>
+      </div>
+    </section>
   </main>
 
   <!-- ================= SETTINGS ================= -->
@@ -903,11 +1285,15 @@ INDEX_HTML = r"""<!doctype html>
 
 <nav class="nav" aria-label="Main">
   <button type="button" id="nav-home" aria-current="page">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/></svg>
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/></svg>
     Home
   </button>
+  <button type="button" id="nav-screen">
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2.5"/><path d="M8 20h8M12 16v4"/></svg>
+    Screen
+  </button>
   <button type="button" id="nav-settings">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
     Settings
   </button>
 </nav>
@@ -916,7 +1302,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const CHECK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1b0a12" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
-let uptime = 0, fetchedAt = Date.now(), running = false, editingId = null;
+let uptime = 0, fetchedAt = Date.now(), running = false, editingId = null, srvMode = "";
 let platforms = [], selected = new Set(), lastDests = [];
 
 const store = {
@@ -932,18 +1318,22 @@ function toast(text, kind) {
 }
 
 // ---------- navigation
+const VIEWS = ["home", "screen", "settings"];
+const viewFromHash = () => VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "home";
 function show(view, push) {
-  ["home", "settings"].forEach(v => {
+  VIEWS.forEach(v => {
     $("view-" + v).classList.toggle("active", v === view);
     const b = $("nav-" + v); if (v === view) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   });
   if (push !== false) history.replaceState(null, "", "#" + view);
   window.scrollTo({ top: 0 });
+  if (view === "screen" && window.onScreen) window.onScreen();
 }
 $("nav-home").addEventListener("click", () => show("home"));
+$("nav-screen").addEventListener("click", () => show("screen"));
 $("nav-settings").addEventListener("click", () => show("settings"));
 $("goSettings").addEventListener("click", () => show("settings"));
-window.addEventListener("hashchange", () => show(location.hash === "#settings" ? "settings" : "home", false));
+window.addEventListener("hashchange", () => show(viewFromHash(), false));
 
 // ---------- platforms
 function loadPlatforms() {
@@ -983,7 +1373,7 @@ function renderHome() {
     if (d) {
       sm.dataset.st = !d.active ? "off" : d.phase === "reconnecting" ? "retry" : "live";
       sm.textContent = !d.active ? "Stopped" : (d.phase === "reconnecting" ? "Reconnecting…" : "Live")
-        + (d.restarts ? " (resumed " + d.restarts + "x)" : "");
+        + (d.restarts ? " (reconnected " + d.restarts + "x)" : "");
     }
     pt.append(nm, sm);
     const ck = document.createElement("span"); ck.className = "ck"; ck.innerHTML = CHECK;
@@ -1050,7 +1440,7 @@ $("savePlat").addEventListener("click", () => {
 
 $("chips").addEventListener("click", e => {
   const c = e.target.closest(".chip"); if (!c) return;
-  const names = [...document.querySelectorAll(".chip")].map(x => x.dataset.name);
+  const names = [...document.querySelectorAll("#chips .chip")].map(x => x.dataset.name);
   $("p_url").value = c.dataset.url;
   if (!$("p_name").value.trim() || names.includes($("p_name").value.trim())) $("p_name").value = c.dataset.name;
   $("p_key").focus();
@@ -1066,10 +1456,13 @@ $("selAll").addEventListener("click", () => {
 });
 
 // ---------- source + cookies (remembered across refreshes)
-["video_url", "quality", "cookies"].forEach(k => ["input", "change"].forEach(ev => $(k).addEventListener(ev, () => {
+["video_url", "quality", "cookies", "oq"].forEach(k => ["input", "change"].forEach(ev => $(k).addEventListener(ev, () => {
   store.set(k, $(k).value); if (k === "cookies") cookieStatus();
 })));
 $("loop").addEventListener("change", () => store.set("loop", $("loop").checked ? "1" : "0"));
+$("ovmode").addEventListener("change", () => {
+  store.set("ovmode", $("ovmode").checked ? "1" : "0"); $("oqField").hidden = !$("ovmode").checked; updateBadge();
+});
 $("video_url").addEventListener("input", e => {
   const v = e.target.value, d = $("detect");
   const yt = /(youtube\.com|youtu\.be)/i.test(v), dr = /(drive|docs)\.google\.com/i.test(v);
@@ -1102,9 +1495,11 @@ $("run").addEventListener("click", async () => {
   if (!$("video_url").value.trim()) { toast("Paste a YouTube or Drive link first.", "err"); $("video_url").focus(); return; }
   if (!selected.size) { toast(platforms.length ? "Tap at least one platform to stream to." : "Add a platform in Settings first.", "err"); return; }
   $("run").disabled = true; toast("Fetching the video and starting FFmpeg…");
+  if ($("ovmode").checked) await pushOverlay();
   try {
     const r = await post("/start", { video_url: $("video_url").value, quality: $("quality").value, loop: $("loop").checked,
-      cookies: $("cookies").value, destinations: pickDests(platforms.filter(p => selected.has(p.id))) });
+      cookies: $("cookies").value, overlay: $("ovmode").checked, oq: $("oq").value,
+      destinations: pickDests(platforms.filter(p => selected.has(p.id))) });
     if (r.ok) toast("You’re live on " + r.data.count + (r.data.count === 1 ? " platform" : " platforms") + ". You can close this tab.", "ok");
     else {
       toast(r.data.error || "Couldn’t start the stream.", "err");
@@ -1127,7 +1522,15 @@ async function refresh() {
     $("nowLabel").textContent = r.running ? "Now streaming" : (lastDests.length ? "Last stream ended" : "Nothing is streaming");
     $("nowTitle").textContent = r.title || "Ready when you are";
     $("pillText").textContent = !r.running ? "Server idle" : (live ? "Live on " : "Reconnecting ") + (live || total) + " of " + total + (total === 1 ? " platform" : " platforms");
-    $("prog").textContent = r.running && r.duration ? "Played " + fmt(r.pos) + " of " + fmt(r.duration) : "";
+    srvMode = r.running ? r.mode : ""; updateBadge();
+    const bits = [];
+    if (r.running) {
+      bits.push(r.mode === "encode" ? "Screen mode on" : r.mode === "test" ? "Test pattern" : "Direct copy");
+      if (r.duration) bits.push("Played " + fmt(r.pos) + " of " + fmt(r.duration));
+      if (r.src_phase === "reconnecting") bits.push("Source reconnecting, platforms held");
+      else if (r.restarts) bits.push("Source resumed " + r.restarts + "×, platforms stayed connected");
+    }
+    $("prog").textContent = bits.join(" · ");
     if (r.logs.length) {
       const el = $("log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
       el.textContent = r.logs.join("\n"); if (atEnd) el.scrollTop = el.scrollHeight;
@@ -1139,12 +1542,243 @@ async function refresh() {
   } catch (e) { /* offline is fine: the server keeps streaming */ }
 }
 
+// ================= screen editor =================
+const W = 1280, H = 720;
+const cv = $("cv"), cx = cv.getContext("2d");
+cv.width = W; cv.height = H;
+let scene = [], selId = null, bgImg = null, drag = null, lastGrab = "", pushT = null;
+const imgs = {};
+const cur = () => scene.find(e => e.id === selId) || null;
+const pxs = () => (cv.getBoundingClientRect().width / W) || 1;
+const handleR = () => Math.max(14, 15 / pxs());
+
+function imgFor(e) {
+  let im = imgs[e.id];
+  if (!im || im._src !== e.src) { im = new Image(); im._src = e.src; im.onload = () => { render(); schedulePush(); }; im.src = e.src; imgs[e.id] = im; }
+  return im;
+}
+function rr(c, x, y, w, h, r) {
+  c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function wrapText(c, text, maxW) {
+  const out = [];
+  String(text).split("\n").forEach(par => {
+    let line = "";
+    par.split(" ").forEach(word => {
+      const t = line ? line + " " + word : word;
+      if (c.measureText(t).width > maxW && line) { out.push(line); line = word; } else line = t;
+    });
+    out.push(line);
+  });
+  return out;
+}
+function drawText(c, e) {
+  c.font = (e.bold ? "700 " : "400 ") + e.fs + 'px "Space Grotesk", system-ui, sans-serif';
+  c.fillStyle = e.color; c.textBaseline = "middle"; c.textAlign = e.align;
+  const lines = wrapText(c, e.text, Math.max(10, e.w - 24)), lh = e.fs * 1.2;
+  let y = -(lines.length * lh) / 2 + lh / 2;
+  const x = e.align === "left" ? -e.w / 2 + 12 : e.align === "right" ? e.w / 2 - 12 : 0;
+  lines.forEach(l => { c.fillText(l, x, y); y += lh; });
+}
+function drawEl(c, e) {
+  c.save(); c.translate(e.x, e.y); c.rotate(e.rot * Math.PI / 180); c.globalAlpha = e.op;
+  const w = e.w, h = e.h;
+  if (e.type === "image") {
+    const im = imgFor(e);
+    if (im.complete && im.naturalWidth) c.drawImage(im, -w / 2, -h / 2, w, h);
+    if (e.sw > 0) { c.lineWidth = e.sw; c.strokeStyle = e.stroke; c.strokeRect(-w / 2, -h / 2, w, h); }
+  } else {
+    c.beginPath();
+    if (e.type === "circle") c.ellipse(0, 0, w / 2, h / 2, 0, 0, Math.PI * 2);
+    else rr(c, -w / 2, -h / 2, w, h, e.type === "round" || e.type === "rect" ? Math.min(e.r, w / 2, h / 2) : 0);
+    if (e.fill) { c.fillStyle = e.fill; c.fill(); }
+    if (e.sw > 0) { c.lineWidth = e.sw; c.strokeStyle = e.stroke; c.stroke(); }
+    if (e.text) drawText(c, e);
+  }
+  c.restore();
+}
+function drawSel(e) {
+  const hr = handleR(), s = pxs(), ry = -e.h / 2 - hr * 2.6;
+  cx.save(); cx.translate(e.x, e.y); cx.rotate(e.rot * Math.PI / 180);
+  cx.strokeStyle = "#36e2ff"; cx.lineWidth = 2 / s; cx.setLineDash([8 / s, 6 / s]);
+  cx.strokeRect(-e.w / 2, -e.h / 2, e.w, e.h); cx.setLineDash([]);
+  cx.beginPath(); cx.moveTo(0, -e.h / 2); cx.lineTo(0, ry); cx.stroke();
+  cx.fillStyle = "#fff";
+  [[e.w / 2, e.h / 2], [0, ry]].forEach(([x, y]) => { cx.beginPath(); cx.arc(x, y, hr * .8, 0, 7); cx.fill(); cx.stroke(); });
+  cx.restore();
+}
+function render() {
+  cx.globalAlpha = 1; cx.fillStyle = "#0b0720"; cx.fillRect(0, 0, W, H);
+  if (bgImg) { const k = Math.min(W / bgImg.width, H / bgImg.height), w = bgImg.width * k, h = bgImg.height * k; cx.drawImage(bgImg, (W - w) / 2, (H - h) / 2, w, h); }
+  else { cx.fillStyle = "rgba(255,255,255,.35)"; cx.font = '28px "Space Grotesk", sans-serif'; cx.textAlign = "center"; cx.textBaseline = "middle"; cx.fillText("Tap “Grab live frame” to see your video here", W / 2, H / 2); }
+  scene.forEach(e => drawEl(cx, e));
+  const s = cur(); if (s) drawSel(s);
+}
+
+function updateBadge() {
+  const b = $("ovBadge"); let t, c;
+  if (running && srvMode === "encode") { t = "LIVE: your changes appear on the stream within about a second."; c = "on"; }
+  else if (running) { t = "This stream is in direct-copy mode, so elements won’t show. Stop, turn on Screen mode on Home, and run again."; c = "warn"; }
+  else if ($("ovmode").checked) { t = "Screen mode is on: these elements will show on the live when you press Run."; c = "on"; }
+  else { t = "Screen mode is off. Turn it on at Home to put these elements on the live."; c = "warn"; }
+  b.textContent = t; b.className = "badge " + c;
+}
+
+function persist() { store.set("scene", JSON.stringify(scene)); }
+function changed() { persist(); render(); schedulePush(); }
+function overlayBlob() {
+  const oc = document.createElement("canvas"); oc.width = W; oc.height = H;
+  const c = oc.getContext("2d"); scene.forEach(e => drawEl(c, e));
+  return new Promise(res => oc.toBlob(res, "image/png"));
+}
+async function pushOverlay() {
+  try { const b = await overlayBlob(); await fetch("/overlay", { method: "POST", headers: { "Content-Type": "image/png" }, body: b }); } catch (e) {}
+}
+function schedulePush() {
+  if (!(running && srvMode === "encode") || pushT) return;
+  pushT = setTimeout(() => { pushT = null; pushOverlay(); }, 400);
+}
+
+function addEl(type, extra) {
+  const e = Object.assign({ id: newId(), type, x: W / 2, y: H / 2, w: 360, h: 120, rot: 0, op: 1,
+    fill: "#ff3366", stroke: "#ffffff", sw: 0, text: "", color: "#ffffff", fs: 48, bold: true, r: 0, align: "center" }, extra || {});
+  if (type === "text") { e.text = "Your text"; e.fill = ""; e.w = 480; e.h = 90; }
+  if (type === "round") { e.r = 40; e.text = "Text"; }
+  if (type === "circle") { e.w = e.h = 200; }
+  scene.push(e); selId = e.id; changed(); renderProps();
+}
+document.querySelectorAll("[data-add]").forEach(b => b.addEventListener("click", () => addEl(b.dataset.add)));
+$("clearAll").addEventListener("click", () => { if (!scene.length || !confirm("Remove every element?")) return; scene = []; selId = null; changed(); renderProps(); });
+
+$("addImg").addEventListener("click", () => $("imgFile").click());
+$("imgFile").addEventListener("change", ev => {
+  const f = ev.target.files[0]; ev.target.value = ""; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    const im = new Image();
+    im.onload = () => {
+      const k = Math.min(1, 1280 / Math.max(im.width, im.height)), c = document.createElement("canvas");
+      c.width = Math.round(im.width * k); c.height = Math.round(im.height * k);
+      c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+      const keepAlpha = /png|gif|webp|svg/.test(f.type);
+      const url = c.toDataURL(keepAlpha ? "image/png" : "image/jpeg", .9);
+      const fit = Math.min(400 / c.width, 300 / c.height, 1.5);
+      addEl("image", { src: url, w: Math.round(c.width * fit), h: Math.round(c.height * fit) });
+    };
+    im.src = rd.result;
+  };
+  rd.readAsDataURL(f);
+});
+
+// pointer: move, resize (corner dot), rotate (top dot)
+const pt = ev => { const r = cv.getBoundingClientRect(); return { x: (ev.clientX - r.left) * W / r.width, y: (ev.clientY - r.top) * H / r.height }; };
+function toLocal(e, p) {
+  const a = -e.rot * Math.PI / 180, dx = p.x - e.x, dy = p.y - e.y;
+  return { x: dx * Math.cos(a) - dy * Math.sin(a), y: dx * Math.sin(a) + dy * Math.cos(a) };
+}
+cv.addEventListener("pointerdown", ev => {
+  const p = pt(ev), hr = handleR(), s = cur();
+  drag = null;
+  if (s) {
+    const l = toLocal(s, p);
+    if (Math.hypot(l.x - s.w / 2, l.y - s.h / 2) < hr * 1.6) drag = { mode: "scale", id: s.id, ratio: s.w / s.h };
+    else if (Math.hypot(l.x, l.y + s.h / 2 + hr * 2.6) < hr * 1.6) drag = { mode: "rot", id: s.id };
+  }
+  if (!drag) {
+    let hit = null;
+    for (let i = scene.length - 1; i >= 0; i--) { const e = scene[i], l = toLocal(e, p); if (Math.abs(l.x) <= e.w / 2 && Math.abs(l.y) <= e.h / 2) { hit = e; break; } }
+    selId = hit ? hit.id : null;
+    if (hit) drag = { mode: "move", id: hit.id, dx: p.x - hit.x, dy: p.y - hit.y };
+    renderProps();
+  }
+  if (drag) { try { cv.setPointerCapture(ev.pointerId); } catch (e) {} }
+  render(); ev.preventDefault();
+});
+cv.addEventListener("pointermove", ev => {
+  if (!drag) return;
+  const e = scene.find(x => x.id === drag.id); if (!e) return;
+  const p = pt(ev); drag.moved = true;
+  if (drag.mode === "move") { e.x = p.x - drag.dx; e.y = p.y - drag.dy; }
+  else if (drag.mode === "scale") {
+    const l = toLocal(e, p); e.w = Math.max(24, Math.abs(l.x) * 2);
+    e.h = e.type === "image" ? e.w / drag.ratio : Math.max(24, Math.abs(l.y) * 2);
+  } else {
+    let r = Math.atan2(p.y - e.y, p.x - e.x) * 180 / Math.PI + 90; r = ((r % 360) + 360) % 360;
+    const sn = Math.round(r / 90) * 90; if (Math.abs(r - sn) < 4) r = sn % 360;
+    e.rot = r;
+  }
+  render(); schedulePush();
+});
+const endDrag = () => { if (drag && drag.moved) { persist(); schedulePush(); } drag = null; };
+cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+window.addEventListener("keydown", ev => {
+  if ((ev.key === "Delete" || ev.key === "Backspace") && cur() && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && $("view-screen").classList.contains("active")) {
+    scene = scene.filter(e => e.id !== selId); selId = null; changed(); renderProps(); ev.preventDefault();
+  }
+});
+
+// properties panel
+const PM = { p_text: ["text", "s"], p_fs: ["fs", "n"], p_color: ["color", "s"], p_sw: ["sw", "n"], p_stroke: ["stroke", "s"], p_r: ["r", "n"], p_op: ["op", "o"], p_align: ["align", "s"] };
+Object.entries(PM).forEach(([id, [k, t]]) => $(id).addEventListener("input", () => {
+  const e = cur(); if (!e) return; const v = $(id).value;
+  e[k] = t === "n" ? +v : t === "o" ? v / 100 : v; changed();
+}));
+$("p_fill").addEventListener("input", () => { const e = cur(); if (!e) return; e.fill = $("p_fill").value; $("p_fillOn").checked = true; changed(); });
+$("p_fillOn").addEventListener("change", () => { const e = cur(); if (!e) return; e.fill = $("p_fillOn").checked ? $("p_fill").value : ""; changed(); });
+$("p_bold").addEventListener("change", () => { const e = cur(); if (!e) return; e.bold = $("p_bold").checked; changed(); });
+$("pDel").addEventListener("click", () => { scene = scene.filter(e => e.id !== selId); selId = null; changed(); renderProps(); });
+$("pDup").addEventListener("click", () => { const e = cur(); if (!e) return; const c = { ...e, id: newId(), x: e.x + 30, y: e.y + 30 }; scene.push(c); selId = c.id; changed(); renderProps(); });
+$("pFront").addEventListener("click", () => { const e = cur(); if (!e) return; scene = scene.filter(x => x !== e).concat(e); changed(); });
+$("pBack").addEventListener("click", () => { const e = cur(); if (!e) return; scene = [e].concat(scene.filter(x => x !== e)); changed(); });
+
+function renderProps() {
+  const e = cur(); $("props").hidden = !e; if (!e) return;
+  const names = { text: "Text", rect: "Rectangle", round: "Rounded box", circle: "Circle", image: "Image" };
+  $("propTitle").textContent = names[e.type] || "Selected";
+  document.querySelectorAll("#props [data-for]").forEach(el => el.hidden = !el.dataset.for.split(" ").includes(e.type));
+  $("p_text").value = e.text || ""; $("p_fs").value = e.fs; $("p_color").value = e.color;
+  $("p_fill").value = e.fill || "#ff3366"; $("p_fillOn").checked = !!e.fill;
+  $("p_op").value = Math.round(e.op * 100); $("p_sw").value = e.sw; $("p_stroke").value = e.stroke;
+  $("p_r").value = e.r; $("p_align").value = e.align; $("p_bold").checked = !!e.bold;
+}
+
+// live frame
+async function grab() {
+  const u = $("video_url").value.trim();
+  if (!u && !running) { toast("Paste the video link on Home first.", "err"); return; }
+  lastGrab = u; $("grab").disabled = true; toast("Grabbing a frame from the video…");
+  try {
+    const res = await fetch("/snapshot", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_url: u, quality: $("quality").value, cookies: $("cookies").value }) });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      toast(j.error || "Couldn’t grab a frame.", "err");
+      if (j.need_cookies) { show("settings"); $("cookieBox").open = true; }
+    } else {
+      const im = new Image(); im.onload = () => { bgImg = im; render(); toast("Screen updated.", "ok"); };
+      im.src = URL.createObjectURL(await res.blob());
+    }
+  } catch (e) { toast("Couldn’t reach the server.", "err"); }
+  $("grab").disabled = false;
+}
+$("grab").addEventListener("click", grab);
+window.onScreen = () => {
+  render(); updateBadge();
+  const u = $("video_url").value.trim();
+  if (u && u !== lastGrab && !bgImg) grab();
+};
+
 // ---------- boot
-["video_url", "quality", "cookies"].forEach(k => { const v = store.get(k); if (v !== null) $(k).value = v; });
+["video_url", "quality", "cookies", "oq"].forEach(k => { const v = store.get(k); if (v !== null) $(k).value = v; });
 $("loop").checked = store.get("loop") === "1";
+$("ovmode").checked = store.get("ovmode") === "1"; $("oqField").hidden = !$("ovmode").checked;
+try { const s = JSON.parse(store.get("scene") || "[]"); scene = Array.isArray(s) ? s : []; } catch (e) { scene = []; }
 $("video_url").dispatchEvent(new Event("input")); cookieStatus();
-loadPlatforms(); renderAll();
-show(location.hash === "#settings" ? "settings" : "home", false);
+loadPlatforms(); renderAll(); render(); updateBadge(); renderProps();
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(render);
+window.addEventListener("resize", render);
+show(viewFromHash(), false);
 refresh(); setInterval(refresh, 3000); setInterval(tick, 1000);
 </script>
 </body>
